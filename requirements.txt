@@ -1,0 +1,39 @@
+# Core utilities
+pydantic>=2.0
+pydantic-settings>=2.0
+structlog>=24.0
+python-dotenv>=1.0
+
+# LLM
+openai>=1.30
+
+# Embeddings (local)
+sentence-transformers>=3.0
+
+# Vector Database
+qdrant-client>=1.9
+
+# Document parsing
+unstructured[pdf,docx,md]>=0.14
+
+# Text splitting
+langchain-text-splitters>=0.2
+
+# Sparse search
+rank-bm25>=0.2
+
+# Reranking
+FlagEmbedding>=1.2
+
+# API
+fastapi>=0.111
+uvicorn[standard]>=0.30
+sse-starlette>=2.0
+python-multipart>=0.0.9
+
+# Chat UI
+gradio>=4.0
+
+# Evaluation
+ragas>=0.1
+datasets>=2.0

@@ -1,0 +1,61 @@
+[tool.poetry]
+name = "rag-chatbot"
+version = "0.1.0"
+description = "Internal RAG Chatbot — Advanced RAG techniques showcase"
+authors = ["Binh DV"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+
+# Core utilities
+pydantic = "^2.0"
+pydantic-settings = "^2.0"
+structlog = "^24.0"
+python-dotenv = "^1.0"
+
+# LLM (OpenAI GPT-4o-mini)
+openai = "^1.30"
+
+# Embeddings (local model, miễn phí)
+sentence-transformers = "^3.0"
+
+# Vector Database
+qdrant-client = "^1.9"
+
+# Document parsing (PDF, DOCX, MD)
+unstructured = {version = "^0.14", extras = ["pdf", "docx", "md"]}
+
+# Text splitting
+langchain-text-splitters = "^0.2"
+
+# Sparse search (BM25 keyword matching)
+rank-bm25 = "^0.2"
+
+# Cross-Encoder reranking
+FlagEmbedding = "^1.2"
+
+# API server
+fastapi = "^0.111"
+uvicorn = {version = "^0.30", extras = ["standard"]}
+sse-starlette = "^2.0"
+python-multipart = "^0.0.9"
+
+# Chat UI
+gradio = "^4.0"
+
+# Evaluation (RAG metrics)
+ragas = "^0.1"
+datasets = "^2.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+ruff = "^0.4"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"

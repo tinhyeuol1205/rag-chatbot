@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+"""
+Multi-Query Expansion ★ — Kỹ thuật RAG #3.
+
+Vấn đề:
+  User hỏi "laptop policy" → chỉ search 1 query → có thể bỏ sót documents liên quan.
+
+Giải pháp:
+  Dùng LLM sinh 3 biến thể câu hỏi:
+    "laptop policy"
+    → "What is the company policy on laptop equipment?"
+    → "How do employees receive their work computer?"
+    → "What are the security requirements for company laptops?"
+
+  Search cả 4 queries (gốc + 3 biến thể) → hợp nhất kết quả → recall cao hơn.
+
+Tham khảo: rag_master.md — Module 4, mục 4.1, technique #1
+"""
+
+from openai import OpenAI
+
+from core import get_logger
+from core.config import settings
+
+logger = get_logger(__name__)
+
+MULTI_QUERY_PROMPT = """You are a helpful assistant. Your task is to generate {n} different versions
+of the given user question to retrieve relevant documents from a knowledge base.
+
+By generating multiple perspectives on the question, you help overcome limitations of
+single-query similarity search.
+
+Provide these alternative questions separated by newlines.
+Do NOT include the original question. Do NOT number the questions.
+
+Original question: {query}"""
+
+
+class MultiQueryExpander:
+    """Sinh nhiều biến thể câu hỏi để tăng recall khi search."""
+
+    def __init__(self):
+        # self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        self.client = OpenAI(
+            base_url = settings.OPENAI_BASE_URL,
+            api_key = settings.OPENAI_API_KEY
+        )
+
+
+    def expand(self, query: str) -> list[str]:
+        """Sinh N biến thể + trả về cùng query gốc.
+
+        Args:
+            query: Câu hỏi gốc của user
+
+        Returns:
+            [original_query, variant_1, variant_2, ...variant_N]
+        """
+        logger.info("Expanding query", original=query, n_variants=settings.EXPAND_N_QUERY)
+
+        response = self.client.chat.completions.create(
+            model=settings.OPENAI_MODEL_ID,
+            messages=[
+                {"role": "user", "content": MULTI_QUERY_PROMPT.format(
+                    n=settings.EXPAND_N_QUERY,
+                    query=query,
+                )}
+            ],
+            temperature=0.7,  # Creativity cao để tạo biến thể đa dạng
+            max_tokens=300,
+        )
+
+        raw_output = response.choices[0].message.content.strip()
+        variants = [q.strip() for q in raw_output.split("\n") if q.strip()]
+
+        # Ghép query gốc + các biến thể
+        all_queries = [query] + variants[:settings.EXPAND_N_QUERY]
+
+        logger.info("Query expanded", total_queries=len(all_queries), variants=variants)
+        return all_queries
