@@ -17,6 +17,7 @@ build/
 venv/
 rag/
 env/
+.gradio/
 
 # ============================================
 # Environment Variables (CHỨA API KEY — TUYỆT ĐỐI KHÔNG PUSH)

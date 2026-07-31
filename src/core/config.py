@@ -29,10 +29,17 @@ class Settings(BaseSettings):
         extra="ignore",  # Bỏ qua biến .env không khai báo ở đây
     )
 
-    # --- OpenAI ---
+    # --- LLM Provider (chọn "openai" hoặc "gemini") ---
+    LLM_PROVIDER: str = "openai"
+
+    # --- OpenAI / NVIDIA NIM ---
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL_ID: str = "gpt-4o-mini"
     OPENAI_BASE_URL: str = ""
+
+    # --- Google Gemini ---
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL_ID: str = "gemini-2.5-flash"
 
     # --- Qdrant ---
     QDRANT_HOST: str = "localhost"

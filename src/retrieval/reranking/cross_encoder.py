@@ -29,7 +29,7 @@ Model: BAAI/bge-reranker-v2-m3 — top đầu MTEB reranking benchmark
 Tham khảo: rag_master.md — Module 5, mục 5.1
 """
 
-from FlagEmbedding import FlagReranker
+from sentence_transformers import CrossEncoder
 
 from core import get_logger
 from core.config import settings
@@ -40,17 +40,14 @@ logger = get_logger(__name__)
 class CrossEncoderReranker:
     """Rerank kết quả search bằng Cross-Encoder model."""
 
-    _model: FlagReranker | None = None
+    _model: CrossEncoder | None = None
 
     @property
-    def model(self) -> FlagReranker:
+    def model(self) -> CrossEncoder:
         """Lazy load reranker model."""
         if self._model is None:
             logger.info("Loading reranker model", model=settings.RERANKER_MODEL_ID)
-            self._model = FlagReranker(
-                settings.RERANKER_MODEL_ID,
-                use_fp16=False,  # CPU mode
-            )
+            self._model = CrossEncoder(settings.RERANKER_MODEL_ID)
             logger.info("Reranker loaded")
         return self._model
 
@@ -71,11 +68,7 @@ class CrossEncoderReranker:
         pairs = [(query, doc["content"]) for doc in documents]
 
         # Cross-Encoder scoring — chấm điểm từng cặp
-        scores = self.model.compute_score(pairs)
-
-        # Nếu chỉ 1 document, scores trả về float thay vì list
-        if isinstance(scores, float):
-            scores = [scores]
+        scores = self.model.predict(pairs)
 
         # Gắn score mới vào documents
         for doc, score in zip(documents, scores):
@@ -95,3 +88,4 @@ class CrossEncoderReranker:
         )
 
         return top_docs
+

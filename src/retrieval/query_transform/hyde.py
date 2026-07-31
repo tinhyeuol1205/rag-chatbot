@@ -23,10 +23,8 @@ Giải pháp:
 Tham khảo: rag_master.md — Module 4, mục 4.1, technique #2
 """
 
-from openai import OpenAI
-
 from core import get_logger
-from core.config import settings
+from core.llm import get_llm_service
 from ingestion.embeddings import EmbeddingService
 
 logger = get_logger(__name__)
@@ -42,11 +40,7 @@ class HyDEGenerator:
     """Sinh câu trả lời giả định → embed → dùng làm search vector."""
 
     def __init__(self):
-        # self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        self.client = OpenAI(
-            base_url = settings.OPENAI_BASE_URL,
-            api_key = settings.OPENAI_API_KEY
-        )
+        self.llm = get_llm_service()
         self.embedder = EmbeddingService()
 
     def generate_embedding(self, query: str) -> list[float]:
@@ -75,13 +69,9 @@ class HyDEGenerator:
 
     def _generate_hypothetical(self, query: str) -> str:
         """Dùng LLM sinh câu trả lời giả định."""
-        response = self.client.chat.completions.create(
-            model=settings.OPENAI_MODEL_ID,
-            messages=[
-                {"role": "user", "content": HYDE_PROMPT.format(query=query)}
-            ],
+        return self.llm.generate(
+            user_prompt=HYDE_PROMPT.format(query=query),
             temperature=0.5,  # Không quá creative, giữ sát chủ đề
             max_tokens=200,
         )
 
-        return response.choices[0].message.content.strip()

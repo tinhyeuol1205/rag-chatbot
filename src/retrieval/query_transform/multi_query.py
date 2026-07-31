@@ -18,10 +18,9 @@ Giải pháp:
 Tham khảo: rag_master.md — Module 4, mục 4.1, technique #1
 """
 
-from openai import OpenAI
-
 from core import get_logger
 from core.config import settings
+from core.llm import get_llm_service
 
 logger = get_logger(__name__)
 
@@ -41,12 +40,7 @@ class MultiQueryExpander:
     """Sinh nhiều biến thể câu hỏi để tăng recall khi search."""
 
     def __init__(self):
-        # self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
-        self.client = OpenAI(
-            base_url = settings.OPENAI_BASE_URL,
-            api_key = settings.OPENAI_API_KEY
-        )
-
+        self.llm = get_llm_service()
 
     def expand(self, query: str) -> list[str]:
         """Sinh N biến thể + trả về cùng query gốc.
@@ -59,19 +53,15 @@ class MultiQueryExpander:
         """
         logger.info("Expanding query", original=query, n_variants=settings.EXPAND_N_QUERY)
 
-        response = self.client.chat.completions.create(
-            model=settings.OPENAI_MODEL_ID,
-            messages=[
-                {"role": "user", "content": MULTI_QUERY_PROMPT.format(
-                    n=settings.EXPAND_N_QUERY,
-                    query=query,
-                )}
-            ],
+        raw_output = self.llm.generate(
+            user_prompt=MULTI_QUERY_PROMPT.format(
+                n=settings.EXPAND_N_QUERY,
+                query=query,
+            ),
             temperature=0.7,  # Creativity cao để tạo biến thể đa dạng
             max_tokens=300,
         )
 
-        raw_output = response.choices[0].message.content.strip()
         variants = [q.strip() for q in raw_output.split("\n") if q.strip()]
 
         # Ghép query gốc + các biến thể
@@ -79,3 +69,4 @@ class MultiQueryExpander:
 
         logger.info("Query expanded", total_queries=len(all_queries), variants=variants)
         return all_queries
+

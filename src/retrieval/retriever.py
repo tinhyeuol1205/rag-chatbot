@@ -34,10 +34,9 @@ Luồng xử lý đầy đủ:
             → Final answer + source citation
 """
 
-from openai import OpenAI
-
 from core import get_logger
 from core.config import settings
+from core.llm import get_llm_service
 from retrieval.context.assembler import ContextAssembler
 from retrieval.context.parent_resolver import ParentResolver
 from retrieval.prompts import RAG_USER_PROMPT, SYSTEM_PROMPT
@@ -59,11 +58,7 @@ class RAGRetriever:
         self.reranker = CrossEncoderReranker()
         self.parent_resolver = ParentResolver()
         self.assembler = ContextAssembler()
-        # self.llm = OpenAI(api_key=settings.OPENAI_API_KEY)
-        self.llm = OpenAI(
-            base_url = settings.OPENAI_BASE_URL,
-            api_key = settings.OPENAI_API_KEY
-        )
+        self.llm = get_llm_service()
 
     def query(self, user_query: str, stream: bool = False):
         """Xử lý câu hỏi qua toàn bộ RAG pipeline.
@@ -116,38 +111,28 @@ class RAGRetriever:
 
     def _generate(self, query: str, context: str, sources: str) -> str:
         """Gọi LLM sinh câu trả lời (non-streaming)."""
-        response = self.llm.chat.completions.create(
-            model=settings.OPENAI_MODEL_ID,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": RAG_USER_PROMPT.format(
-                    context=context, sources=sources, query=query
-                )},
-            ],
+        user_prompt = RAG_USER_PROMPT.format(
+            context=context, sources=sources, query=query
+        )
+        answer = self.llm.generate(
+            user_prompt=user_prompt,
+            system_prompt=SYSTEM_PROMPT,
             temperature=0.1,  # Thấp → trả lời sát context, ít hallucination
         )
 
-        answer = response.choices[0].message.content
         logger.info("Answer generated", length=len(answer))
         return answer
 
     def _generate_stream(self, query: str, context: str, sources: str):
         """Gọi LLM sinh câu trả lời (streaming — từng token)."""
-        stream = self.llm.chat.completions.create(
-            model=settings.OPENAI_MODEL_ID,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": RAG_USER_PROMPT.format(
-                    context=context, sources=sources, query=query
-                )},
-            ],
-            temperature=0.1,
-            stream=True,
+        user_prompt = RAG_USER_PROMPT.format(
+            context=context, sources=sources, query=query
         )
-
-        for chunk in stream:
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+        yield from self.llm.generate_stream(
+            user_prompt=user_prompt,
+            system_prompt=SYSTEM_PROMPT,
+            temperature=0.1,
+        )
 
     def _deduplicate(self, results: list[dict]) -> list[dict]:
         """Loại bỏ duplicate chunks (giữ bản có score cao nhất)."""
