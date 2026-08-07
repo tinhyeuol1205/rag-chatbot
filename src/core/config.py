@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     TOP_K: int = 20          # Lấy bao nhiêu kết quả ban đầu (trước reranking)
     KEEP_TOP_K: int = 5      # Giữ lại bao nhiêu sau reranking
     EXPAND_N_QUERY: int = 3  # Tạo bao nhiêu biến thể câu hỏi
+    MAX_CONTEXT_CHARS: int = 24_000  # ~6k token — an toàn cho model 8k+
 
     # --- Chunking Parameters ---
     CHILD_CHUNK_SIZE: int = 400      # Chunk nhỏ (search chính xác)

@@ -96,39 +96,65 @@ class HybridSearcher:
         return final
 
     def _rrf_fusion(self, *result_lists: list[dict]) -> list[dict]:
-        """Reciprocal Rank Fusion — hợp nhất nhiều danh sách kết quả.
+        """Delegate sang hàm module-level (giữ interface cũ)."""
+        return rrf_fusion(*result_lists)
 
-        Công thức: RRF_score(doc) = Σ 1/(k + rank) cho mỗi list chứa doc đó.
 
-        Args:
-            result_lists: Nhiều danh sách kết quả (đã sắp xếp theo relevance)
+def rrf_fusion(
+    *result_lists: list[dict],
+    k: int = RRF_K,
+    weights: list[float] | None = None,
+) -> list[dict]:
+    """Reciprocal Rank Fusion — hợp nhất N danh sách kết quả.
 
-        Returns:
-            Danh sách hợp nhất, sắp xếp theo RRF score giảm dần
-        """
-        rrf_scores: dict[str, float] = {}      # chunk_id → RRF score
-        doc_store: dict[str, dict] = {}         # chunk_id → document data
+    Công thức: RRF_score(doc) = Σ w_m / (k + rank_m(doc))
+    với rank_m bắt đầu từ 1 (đúng paper Cormack et al.).
 
-        for result_list in result_lists:
-            for rank, doc in enumerate(result_list):
-                chunk_id = doc["chunk_id"]
+    Điểm được CỘNG DỒN qua mọi list chứa doc — đây là tín hiệu chính của
+    Multi-Query / Hybrid: "bao nhiêu query cùng đồng ý". (Chunk ở nhiều list
+    thắng chunk chỉ ở 1 list.)
 
-                # Công thức RRF: 1 / (k + rank)
-                # rank bắt đầu từ 0, nên rank 0 = vị trí #1
-                rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0) + 1.0 / (RRF_K + rank)
+    Args:
+        result_lists: Nhiều danh sách kết quả (đã sắp xếp theo relevance)
+        k: Hằng số RRF (mặc định 60 theo paper)
+        weights: Trọng số cho từng list (optional). Mặc định 1.0 cho mọi list.
 
-                # Lưu doc data (lấy lần đầu gặp)
-                if chunk_id not in doc_store:
-                    doc_store[chunk_id] = doc
+    Returns:
+        Danh sách hợp nhất, sắp xếp theo RRF score giảm dần.
+        Mỗi doc có thêm 'rrf_score' và 'n_hits' (số list chứa doc đó).
+    """
+    if not result_lists:
+        return []
+    if weights is not None and len(weights) != len(result_lists):
+        raise ValueError("weights phải có cùng số phần tử với result_lists")
+    if weights is None:
+        weights = [1.0] * len(result_lists)
 
-        # Sắp xếp theo RRF score giảm dần
-        sorted_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)
+    rrf_scores: dict[str, float] = {}      # chunk_id → RRF score
+    hit_counts: dict[str, int] = {}        # chunk_id → số list chứa doc
+    doc_store: dict[str, dict] = {}         # chunk_id → document data
 
-        # Build kết quả cuối
-        merged = []
-        for chunk_id in sorted_ids:
-            doc = doc_store[chunk_id].copy()
-            doc["rrf_score"] = rrf_scores[chunk_id]
-            merged.append(doc)
+    for w, result_list in zip(weights, result_lists):
+        for rank, doc in enumerate(result_list, start=1):   # ★ rank tính từ 1
+            chunk_id = doc["chunk_id"]
 
-        return merged
+            # Công thức RRF: w / (k + rank), rank ≥ 1 (đúng paper Cormack et al.)
+            rrf_scores[chunk_id] = rrf_scores.get(chunk_id, 0.0) + w / (k + rank)
+            hit_counts[chunk_id] = hit_counts.get(chunk_id, 0) + 1
+
+            # Lưu doc data (lấy lần đầu gặp)
+            if chunk_id not in doc_store:
+                doc_store[chunk_id] = doc
+
+    # Sắp xếp theo RRF score giảm dần
+    sorted_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)
+
+    # Build kết quả cuối
+    merged = []
+    for chunk_id in sorted_ids:
+        doc = doc_store[chunk_id].copy()
+        doc["rrf_score"] = rrf_scores[chunk_id]
+        doc["n_hits"] = hit_counts[chunk_id]   # hữu ích để debug/log
+        merged.append(doc)
+
+    return merged

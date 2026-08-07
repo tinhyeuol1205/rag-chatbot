@@ -16,9 +16,9 @@ Luồng xử lý đầy đủ:
       │     → hyde_vector (384d)
       │
       ├─③ Hybrid Search cho MỖI query (Dense + BM25 + RRF)
-      │     → merged_results (20+ chunks)
+      │     → 1 result_list cho mỗi query
       │
-      ├─④ Deduplicate kết quả từ tất cả queries
+      ├─④ RRF Fusion trên TẤT CẢ queries (điểm cộng dồn)
       │     → unique_results
       │
       ├─⑤ Cross-Encoder Reranking
@@ -30,7 +30,7 @@ Luồng xử lý đầy đủ:
       ├─⑦ Context Assembly + Lost-in-Middle reorder
       │     → context_text + sources_text
       │
-      └─⑧ LLM Generation (GPT-4o-mini)
+      └─⑧ LLM Generation (provider-agnostic)
             → Final answer + source citation
 """
 
@@ -43,7 +43,14 @@ from retrieval.prompts import RAG_USER_PROMPT, SYSTEM_PROMPT
 from retrieval.query_transform.hyde import HyDEGenerator
 from retrieval.query_transform.multi_query import MultiQueryExpander
 from retrieval.reranking.cross_encoder import CrossEncoderReranker
-from retrieval.search.hybrid import HybridSearcher
+from retrieval.search.hybrid import HybridSearcher, rrf_fusion
+
+logger = get_logger(__name__)
+
+NO_CONTEXT_MSG = (
+    "I don't have enough information in the company documents "
+    "to answer this question."
+)
 
 logger = get_logger(__name__)
 
@@ -78,21 +85,20 @@ class RAGRetriever:
         # ② HyDE — sinh hypothetical answer embedding
         hyde_vector = self.hyde.generate_embedding(user_query)
 
-        # ③ Hybrid Search cho mỗi query + HyDE
-        all_results = []
-
-        # Search bằng HyDE vector (query đầu tiên)
-        hyde_results = self.searcher.search(user_query, hyde_vector=hyde_vector)
-        all_results.extend(hyde_results)
-
-        # Search bằng mỗi expanded query (không dùng HyDE)
+        # ③ Hybrid Search — thu từng result_list RIÊNG BIỆT (không gộp chung)
+        result_lists = [self.searcher.search(user_query, hyde_vector=hyde_vector)]
         for eq in expanded_queries:
-            results = self.searcher.search(eq)
-            all_results.extend(results)
+            result_lists.append(self.searcher.search(eq))
 
-        # ④ Deduplicate
-        unique = self._deduplicate(all_results)
-        logger.info("After dedup", total=len(all_results), unique=len(unique))
+        # ④ RRF Fusion trên TẤT CẢ cùng lúc — điểm cộng dồn qua mọi query
+        unique = rrf_fusion(*result_lists)
+        logger.info(
+            "Fusion done",
+            n_lists=len(result_lists),
+            total_rows=sum(len(r) for r in result_lists),
+            unique=len(unique),
+            top_n_hits=unique[0]["n_hits"] if unique else 0,
+        )
 
         # ⑤ Cross-Encoder Reranking
         top_chunks = self.reranker.rerank(user_query, unique)
@@ -103,7 +109,11 @@ class RAGRetriever:
         # ⑦ Context Assembly
         context_text, sources_text = self.assembler.assemble(resolved)
 
-        # ⑧ LLM Generation
+        # ⑧ LLM Generation — short-circuit nếu context rỗng (khỏi tốn LLM call vô ích)
+        if not context_text.strip():
+            logger.warning("Empty context — skipping LLM call", query=user_query[:80])
+            return iter([NO_CONTEXT_MSG]) if stream else NO_CONTEXT_MSG
+
         if stream:
             return self._generate_stream(user_query, context_text, sources_text)
         else:
@@ -134,18 +144,3 @@ class RAGRetriever:
             temperature=0.1,
         )
 
-    def _deduplicate(self, results: list[dict]) -> list[dict]:
-        """Loại bỏ duplicate chunks (giữ bản có score cao nhất)."""
-        seen: dict[str, dict] = {}
-        for doc in results:
-            cid = doc["chunk_id"]
-            if cid not in seen:
-                seen[cid] = doc
-            else:
-                # Giữ bản có RRF score cao hơn
-                existing_score = seen[cid].get("rrf_score", seen[cid].get("score", 0))
-                new_score = doc.get("rrf_score", doc.get("score", 0))
-                if new_score > existing_score:
-                    seen[cid] = doc
-
-        return list(seen.values())

@@ -10,13 +10,18 @@ Nó đếm TẦN SUẤT từ khóa xuất hiện trong document, có điều ch�
   - Document length normalization: Doc ngắn match 1 từ → quan trọng hơn doc dài match 1 từ
 
 Ưu điểm: Chính xác với từ khóa, mã sản phẩm, tên riêng
-  "TC-456" → BM25 tìm CHÍNH XÁC document chứa "TC-456"
+  "TC-456" → BM25 tìm CHÍNH XÁC document chứa "TC-456" (kể cả khi dính dấu câu)
 
 Nhược điểm: Không hiểu ngữ nghĩa
   "xe hơi" ≠ "ô tô" → BM25 coi là 2 từ KHÁC NHAU
 
+Giới hạn: chỉ hoạt động tốt với ngôn ngữ có space phân từ (Anh, Việt có dấu cách).
+  CJK (Trung/Nhật/Hàn) cần tokenizer riêng — chưa hỗ trợ.
+
 Tham khảo: rag_master.md — Module 3, mục 3.1 (Sparse Embeddings)
 """
+
+import re
 
 from rank_bm25 import BM25Okapi
 
@@ -26,6 +31,16 @@ from core.db import QdrantConnector
 from core.errors import RetrievalError
 
 logger = get_logger(__name__)
+
+# Tokenizer giữ được mã kiểu 'TC-456' kể cả khi dính dấu câu:
+#   "see TC-456."    → ['tc-456']
+#   "(TC-456), done" → ['tc-456', 'done']
+_TOKEN_RE = re.compile(r"[0-9a-z]+(?:[-_][0-9a-z]+)*", re.UNICODE)
+
+
+def tokenize(text: str) -> list[str]:
+    """Tokenize text: lowercase + giữ mã hiệu dính dấu câu."""
+    return _TOKEN_RE.findall(text.lower())
 
 
 class SparseSearcher:
@@ -58,8 +73,8 @@ class SparseSearcher:
         if not self._documents:
             return []
 
-        # Tokenize query (đơn giản: split theo space, lowercase)
-        query_tokens = query.lower().split()
+        # Tokenize query — giữ mã hiệu dính dấu câu
+        query_tokens = tokenize(query)
 
         # BM25 scoring
         scores = self._index.get_scores(query_tokens)
@@ -114,8 +129,8 @@ class SparseSearcher:
                 "file_name": point.payload.get("file_name", ""),
                 "section_title": point.payload.get("section_title", ""),
             })
-            # Tokenize: lowercase + split by space
-            corpus.append(content.lower().split())
+            # Tokenize: giữ mã hiệu dính dấu câu
+            corpus.append(tokenize(content))
 
         if corpus:
             self._index = BM25Okapi(corpus)
