@@ -43,7 +43,7 @@ class HyDEGenerator:
         self.llm = get_llm_service()
         self.embedder = EmbeddingService()
 
-    def generate_embedding(self, query: str) -> list[float]:
+    def generate_embedding(self, query: str) -> list[float] | None:
         """Tạo HyDE embedding cho query.
 
         Flow: query → LLM sinh hypothetical answer → embed answer → vector
@@ -52,10 +52,18 @@ class HyDEGenerator:
             query: Câu hỏi của user
 
         Returns:
-            Vector 384d (embed từ hypothetical answer, KHÔNG phải từ query)
+            Vector 384d (embed từ hypothetical answer, KHÔNG phải từ query),
+            hoặc None nếu HyDE fail → caller sẽ dùng dense search thường.
         """
         # Bước 1: LLM sinh câu trả lời giả
-        hypothetical_answer = self._generate_hypothetical(query)
+        try:
+            hypothetical_answer = self._generate_hypothetical(query)
+        except Exception as e:
+            logger.warning("HyDE generation failed, skipping HyDE", error=str(e))
+            return None
+        if not hypothetical_answer.strip():
+            logger.warning("HyDE returned empty text, skipping HyDE")
+            return None
 
         # Bước 2: Embed câu trả lời giả (không phải embed query!)
         vector = self.embedder.embed_single(hypothetical_answer)

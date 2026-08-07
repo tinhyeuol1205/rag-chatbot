@@ -49,6 +49,7 @@ class BaseLLMService(ABC):
         user_prompt: str,
         system_prompt: str = "",
         temperature: float = 0.1,
+        max_tokens: int = 1024,
     ):
         """Gọi LLM và trả về generator (streaming)."""
         pass
@@ -86,13 +87,25 @@ class OpenAILLMService(BaseLLMService):
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        return response.choices[0].message.content.strip()
+        if not response.choices:
+            logger.warning("LLM returned no choices")
+            return ""
+        choice = response.choices[0]
+        content = choice.message.content
+        if content is None:
+            # finish_reason == "content_filter" / tool_call-only / reasoning model
+            # chỉ điền reasoning_content → content None
+            logger.warning("LLM returned empty content",
+                           finish_reason=choice.finish_reason)
+            return ""
+        return content.strip()
 
     def generate_stream(
         self,
         user_prompt: str,
         system_prompt: str = "",
         temperature: float = 0.1,
+        max_tokens: int = 1024,
     ):
         messages = []
         if system_prompt:
@@ -103,11 +116,15 @@ class OpenAILLMService(BaseLLMService):
             model=self._model,
             messages=messages,
             temperature=temperature,
+            max_tokens=max_tokens,
             stream=True,
         )
         for chunk in stream:
-            if chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+            if not chunk.choices:  # usage-only chunk → bỏ qua (vLLM/NIM/Azure)
+                continue
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                yield delta.content
 
 
 class GeminiLLMService(BaseLLMService):
@@ -159,6 +176,7 @@ class GeminiLLMService(BaseLLMService):
         user_prompt: str,
         system_prompt: str = "",
         temperature: float = 0.1,
+        max_tokens: int = 1024,
     ):
         """Gemini streaming qua Interactions API."""
 

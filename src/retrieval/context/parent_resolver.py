@@ -66,33 +66,56 @@ class ParentResolver:
 
         # Thay child content bằng parent content
         resolved = []
-        seen_parent_ids = set()
+        seen_parent_ids: set[str] = set()
+        missing_parents = 0
+        deduped = 0
 
         for doc in child_results:
-            pid = str(doc.get("parent_id", "")).replace("-", "")
+            pid = str(doc.get("parent_id") or "").replace("-", "")
 
-            if pid and pid in parent_map and pid not in seen_parent_ids:
-                # Thay content bằng parent (đầy đủ hơn)
-                parent_payload = parent_map[pid]
-                resolved.append({
-                    "chunk_id": pid,
-                    "content": parent_payload.get("content", doc["content"]),
-                    "score": doc.get("rerank_score", doc.get("score", 0)),
-                    "file_name": parent_payload.get("file_name", doc.get("file_name", "")),
-                    "section_title": parent_payload.get("section_title", ""),
-                    "is_parent": True,
-                })
-                seen_parent_ids.add(pid)  # Deduplicate
-
-            elif not pid:
-                # Không có parent → giữ nguyên child
+            if not pid:
+                # Child không có parent → giữ nguyên child
                 resolved.append(doc)
+                continue
+
+            if pid in seen_parent_ids:
+                # 2 child cùng parent → bỏ 1 (deduplicate)
+                deduped += 1
+                continue
+
+            parent_payload = parent_map.get(pid)
+            if parent_payload is None:
+                # ★ FALLBACK: parent mất trong DB → dùng child, KHÔNG được xoá
+                # (VD sau re-ingest: child cũ còn trỏ tới parent đã không tồn tại)
+                missing_parents += 1
+                resolved.append(doc)
+                continue
+
+            # Thay content bằng parent (đầy đủ hơn)
+            seen_parent_ids.add(pid)
+            resolved.append({
+                "chunk_id": pid,
+                "content": parent_payload.get("content") or doc["content"],
+                "score": doc.get("rerank_score", doc.get("score", 0)),
+                "file_name": parent_payload.get("file_name") or doc.get("file_name", ""),
+                "section_title": parent_payload.get("section_title") or doc.get("section_title", ""),
+                "page_number": parent_payload.get("page_number") or doc.get("page_number"),
+                "is_parent": True,
+            })
+
+        if missing_parents:
+            logger.warning(
+                "Parent chunks missing in DB — fell back to child chunks. "
+                "Có thể do re-ingest để lại chunk rác, cần chạy lại ingest sạch.",
+                missing=missing_parents,
+            )
 
         logger.info(
             "Parent resolution done",
             children_in=len(child_results),
-            parents_out=len(resolved),
-            deduplicated=len(child_results) - len(resolved),
+            docs_out=len(resolved),
+            deduplicated=deduped,
+            missing_parents=missing_parents,
         )
 
         return resolved

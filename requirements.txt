@@ -1,38 +1,40 @@
 # Core utilities
-pydantic>=2.0
-pydantic-settings>=2.0
-structlog>=24.0
-python-dotenv>=1.0
+pydantic>=2.7,<3
+pydantic-settings>=2.2,<3
+structlog>=24.1,<27
 
 # LLM
-openai>=1.30
-google-genai==2.15.0
+openai>=1.30,<3
+google-genai==2.15.0          # yêu cầu Python >=3.10 (khớp pyproject.toml)
 
-# Embeddings (local)
-sentence-transformers>=3.0
+# Embeddings + Reranker (local)
+sentence-transformers>=3.0,<6
 
 # Vector Database
-qdrant-client>=1.9
+qdrant-client>=1.9,<2
 
-# Document parsing
-unstructured[pdf,docx,md]>=0.14
+# Document parsing (PDF, DOCX, MD)
+unstructured[pdf,docx,md]>=0.14,<0.25
 
 # Text splitting
-langchain-text-splitters>=0.2
+langchain-text-splitters>=0.2,<0.4
 
-# Sparse search
-rank-bm25>=0.2
+# Sparse search (BM25 keyword matching)
+rank-bm25>=0.2,<0.3
 
 # API
-fastapi>=0.111
-uvicorn[standard]>=0.30
-sse-starlette>=2.0
-python-multipart>=0.0.9
+fastapi>=0.111,<1
+uvicorn[standard]>=0.30,<1
+sse-starlette>=2.0,<4
 
 # Chat UI
-gradio>=4.0
+gradio>=4.0,<7
 
-# Evaluation
-ragas>=0.1
-datasets>=2.0
-langchain-community<0.2.0
+# Evaluation (RAG metrics)
+ragas>=0.2,<0.5
+langchain-openai>=0.2,<1      # RAGAS judge LLM
+langchain-huggingface>=0.1,<1 # RAGAS judge embeddings
+
+# RAGAS dependency thực tế
+datasets>=4.0
+tiktoken>=0.7

@@ -23,6 +23,7 @@ from rank_bm25 import BM25Okapi
 from core import get_logger
 from core.config import settings
 from core.db import QdrantConnector
+from core.errors import RetrievalError
 
 logger = get_logger(__name__)
 
@@ -93,7 +94,13 @@ class SparseSearcher:
         logger.info("Building BM25 index...")
 
         # Đọc tất cả child chunks từ Qdrant
-        points = self.qdrant.scroll_all(settings.CHILD_COLLECTION)
+        try:
+            points = self.qdrant.scroll_all(settings.CHILD_COLLECTION)
+        except Exception as e:
+            raise RetrievalError(
+                f"Không đọc được collection '{settings.CHILD_COLLECTION}'. "
+                f"Đã chạy 'make ingest' chưa? Lỗi gốc: {e}"
+            ) from e
 
         self._documents = []
         corpus = []  # List of tokenized documents cho BM25

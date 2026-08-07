@@ -53,14 +53,20 @@ class MultiQueryExpander:
         """
         logger.info("Expanding query", original=query, n_variants=settings.EXPAND_N_QUERY)
 
-        raw_output = self.llm.generate(
-            user_prompt=MULTI_QUERY_PROMPT.format(
-                n=settings.EXPAND_N_QUERY,
-                query=query,
-            ),
-            temperature=0.7,  # Creativity cao để tạo biến thể đa dạng
-            max_tokens=300,
-        )
+        try:
+            raw_output = self.llm.generate(
+                user_prompt=MULTI_QUERY_PROMPT.format(
+                    n=settings.EXPAND_N_QUERY,
+                    query=query,
+                ),
+                temperature=0.7,  # Creativity cao để tạo biến thể đa dạng
+                max_tokens=300,
+            )
+        except Exception as e:
+            # ★ Degrade: không có variant vẫn search được bằng query gốc
+            logger.warning("Multi-query expansion failed, using original query only",
+                           error=str(e))
+            return [query]
 
         variants = [q.strip() for q in raw_output.split("\n") if q.strip()]
 

@@ -1,7 +1,10 @@
-PYTHONPATH := $(shell pwd)/src
-PYTHON := python3
+PYTHONPATH := $(abspath src)
+PYTHON := rag/bin/python
+UV := $(shell command -v uv 2>/dev/null || echo /Users/binh.dv/.local/bin/uv)
+# Bắt uv sync đồng bộ vào đúng môi trường rag/ (thay vì tạo .venv mặc định)
+export UV_PROJECT_ENVIRONMENT := rag
 
-.PHONY: help install local-start local-stop ingest run-api run-ui evaluate test clean
+.PHONY: help install install-dev local-start local-stop ingest run-api run-ui evaluate test clean
 
 help: ## Hiển thị danh sách lệnh
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -10,8 +13,11 @@ help: ## Hiển thị danh sách lệnh
 # ------- Setup & Infrastructure -------
 # ======================================
 
-install: ## Cài đặt dependencies
-	pip install -r requirements.txt
+install: ## Cài đặt dependencies (uv sync — đọc pyproject.toml + uv.lock, đồng bộ vào rag/)
+	$(UV) sync
+
+install-dev: ## Cài đặt dependencies + dev deps (pytest, ruff)
+	$(UV) sync --extra dev
 
 local-start: ## Khởi động Qdrant (Docker)
 	docker compose up -d
