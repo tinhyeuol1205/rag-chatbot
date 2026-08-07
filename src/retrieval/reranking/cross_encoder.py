@@ -70,15 +70,13 @@ class CrossEncoderReranker:
         # Cross-Encoder scoring — chấm điểm từng cặp
         scores = self.model.predict(pairs)
 
-        # Gắn score mới vào documents
-        for doc, score in zip(documents, scores):
-            doc["rerank_score"] = float(score)
-
-        # Sắp xếp theo rerank_score giảm dần
-        documents.sort(key=lambda x: x["rerank_score"], reverse=True)
+        # ★ KHÔNG mutate list/dict của caller (bug P3-4):
+        # copy sang dict mới rồi mới sort, input ban đầu giữ nguyên
+        scored = [{**doc, "rerank_score": float(s)} for doc, s in zip(documents, scores)]
+        scored.sort(key=lambda d: d["rerank_score"], reverse=True)
 
         # Giữ lại top KEEP_TOP_K
-        top_docs = documents[:settings.KEEP_TOP_K]
+        top_docs = scored[:settings.KEEP_TOP_K]
 
         logger.info(
             "Reranking done",

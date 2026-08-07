@@ -24,6 +24,7 @@ Tham khảo: rag_master.md — Module 5, mục 5.2
 """
 
 from core import get_logger
+from core.config import settings
 
 logger = get_logger(__name__)
 
@@ -33,6 +34,10 @@ class ContextAssembler:
 
     def assemble(self, documents: list[dict]) -> tuple[str, str]:
         """Tổng hợp documents thành context string cho LLM.
+
+        Cả context block (có [Source N]) và sources summary ([N] ...) được build
+        từ CÙNG list đã reorder → số [N] trong context khớp chính xác với số [N]
+        trong danh sách Sources (bug P2-1: trước đây 2 list khác nhau).
 
         Args:
             documents: Danh sách documents (đã resolve parent)
@@ -46,38 +51,59 @@ class ContextAssembler:
         # Bước 1: Lost-in-Middle reorder
         reordered = self._lost_in_middle_reorder(documents)
 
-        # Bước 2: Ghép context
-        context_parts = []
-        for i, doc in enumerate(reordered, 1):
-            source = doc.get("file_name", "Unknown")
-            section = doc.get("section_title", "")
-            label = f"[Source {i}: {source}"
-            if section:
-                label += f" — {section}"
-            label += "]"
+        # Bước 2: Ghép context + sources từ CÙNG list reordered, kèm token budget
+        context_parts, sources, seen = [], [], set()
+        used_chars, dropped = 0, 0
 
-            context_parts.append(f"{label}\n{doc['content']}")
+        for i, doc in enumerate(reordered, 1):
+            label = f"[Source {i}: {self._format_source(doc)}]"
+            block = f"{label}\n{doc['content']}"
+
+            # ★ P2-10: token budget — bỏ cả block, KHÔNG cắt giữa câu
+            if used_chars + len(block) > settings.MAX_CONTEXT_CHARS and context_parts:
+                dropped += 1
+                continue
+
+            context_parts.append(block)
+            used_chars += len(block)
+
+            key = self._source_key(doc)
+            if key not in seen:
+                seen.add(key)
+                sources.append(f"[{i}] {self._format_source(doc)}")   # ★ CÙNG số i
+
+        if dropped:
+            logger.warning(
+                "Context truncated by budget",
+                dropped_docs=dropped,
+                kept=len(context_parts),
+                budget=settings.MAX_CONTEXT_CHARS,
+                used=used_chars,
+            )
 
         context_text = "\n\n---\n\n".join(context_parts)
-
-        # Bước 3: Tạo sources summary
-        sources = []
-        seen = set()
-        for doc in documents:
-            fname = doc.get("file_name", "Unknown")
-            section = doc.get("section_title", "")
-            key = f"{fname}:{section}"
-            if key not in seen:
-                source_str = f"- {fname}"
-                if section:
-                    source_str += f" → {section}"
-                sources.append(source_str)
-                seen.add(key)
-
         sources_text = "\n".join(sources)
 
-        logger.info("Context assembled", chunks=len(documents), total_chars=len(context_text))
+        logger.info("Context assembled", chunks=len(context_parts), total_chars=len(context_text))
         return context_text, sources_text
+
+    @staticmethod
+    def _format_source(doc: dict) -> str:
+        """Định dạng nguồn: 'file_name → section_title → p.N'."""
+        parts = [doc.get("file_name") or "Unknown"]
+        if doc.get("section_title"):
+            parts.append(doc["section_title"])
+        if doc.get("page_number") is not None:
+            parts.append(f"p.{doc['page_number']}")
+        return " → ".join(parts)
+
+    @staticmethod
+    def _source_key(doc: dict) -> str:
+        """Key để dedupe nguồn trùng lặp (cùng file + section + page)."""
+        return (
+            f"{doc.get('file_name', '')}:{doc.get('section_title', '')}"
+            f":{doc.get('page_number')}"
+        )
 
     def _lost_in_middle_reorder(self, documents: list[dict]) -> list[dict]:
         """Sắp xếp lại theo Lost-in-Middle pattern.
