@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Parent Resolver — Map child chunks → parent chunks.
 
@@ -13,6 +11,8 @@ Ví dụ:
   Parent Resolver → trả về parent "Toàn bộ Quy trình Onboarding..." (2000 chars)
   → LLM có đủ context để trả lời đầy đủ
 """
+
+from __future__ import annotations
 
 from core import get_logger
 from core.config import settings

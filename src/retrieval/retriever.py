@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 RAG Retriever — Main Orchestrator ★
 
@@ -34,6 +32,10 @@ Luồng xử lý đầy đủ:
             → Final answer + source citation
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
 from core import get_logger
 from core.config import settings
 from core.llm import get_llm_service
@@ -52,7 +54,16 @@ NO_CONTEXT_MSG = (
     "to answer this question."
 )
 
-logger = get_logger(__name__)
+
+@dataclass
+class RAGResult:
+    """Kết quả đầy đủ của 1 lượt RAG — dùng cho evaluation và debug."""
+
+    answer: str
+    contexts: list[str] = field(default_factory=list)
+    sources: str = ""
+    expanded_queries: list[str] = field(default_factory=list)
+    num_candidates: int = 0
 
 
 class RAGRetriever:
@@ -67,15 +78,12 @@ class RAGRetriever:
         self.assembler = ContextAssembler()
         self.llm = get_llm_service()
 
-    def query(self, user_query: str, stream: bool = False):
-        """Xử lý câu hỏi qua toàn bộ RAG pipeline.
+    def retrieve(self, user_query: str) -> tuple[list[dict], str, str, list[str]]:
+        """Chạy toàn bộ retrieval, trả về (resolved_docs, context_text, sources_text, expanded).
 
-        Args:
-            user_query: Câu hỏi của user
-            stream: True → trả về generator (SSE), False → trả về string
-
-        Returns:
-            str hoặc generator — câu trả lời từ LLM
+        Tách riêng khỏi generate để evaluation lấy được context THẬT đã đưa vào LLM
+        (bug P0-4: trước đây evaluate tự search riêng → contexts là child chunk,
+        không phải parent chunk LLM thật nhận).
         """
         logger.info("RAG query started", query=user_query[:80])
 
@@ -111,15 +119,42 @@ class RAGRetriever:
         # ⑦ Context Assembly
         context_text, sources_text = self.assembler.assemble(resolved)
 
+        return resolved, context_text, sources_text, expanded_queries
+
+    def query(self, user_query: str, stream: bool = False):
+        """Xử lý câu hỏi qua toàn bộ RAG pipeline.
+
+        Args:
+            user_query: Câu hỏi của user
+            stream: True → trả về generator (SSE), False → trả về string
+
+        Returns:
+            str hoặc generator — câu trả lời từ LLM
+        """
+        _, context, sources, _ = self.retrieve(user_query)
+
         # ⑧ LLM Generation — short-circuit nếu context rỗng (khỏi tốn LLM call vô ích)
-        if not context_text.strip():
+        if not context.strip():
             logger.warning("Empty context — skipping LLM call", query=user_query[:80])
             return iter([NO_CONTEXT_MSG]) if stream else NO_CONTEXT_MSG
 
         if stream:
-            return self._generate_stream(user_query, context_text, sources_text)
+            return self._generate_stream(user_query, context, sources)
         else:
-            return self._generate(user_query, context_text, sources_text)
+            return self._generate(user_query, context, sources)
+
+    def query_with_context(self, user_query: str) -> RAGResult:
+        """Dùng cho evaluation — trả về ĐÚNG context đã đưa vào LLM (bug P0-4)."""
+        resolved, context, sources, expanded = self.retrieve(user_query)
+        answer = (self._generate(user_query, context, sources)
+                  if context.strip() else NO_CONTEXT_MSG)
+        return RAGResult(
+            answer=answer,
+            contexts=[d["content"] for d in resolved],   # ★ context THẬT (parent chunk)
+            sources=sources,
+            expanded_queries=expanded,
+            num_candidates=len(resolved),
+        )
 
     def _generate(self, query: str, context: str, sources: str) -> str:
         """Gọi LLM sinh câu trả lời (non-streaming)."""

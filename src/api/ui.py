@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Gradio Chat UI — Giao diện chat trực quan.
 
@@ -11,6 +9,8 @@ Features:
 Chạy bằng: make run-ui
 Hoặc:      cd src && python -m api.ui
 """
+
+from __future__ import annotations
 
 import gradio as gr
 

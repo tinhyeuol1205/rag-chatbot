@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Parent-Child Chunking ★ — Kỹ thuật RAG #5.
 
@@ -19,6 +17,8 @@ Khi retrieval:
 
 Tham khảo: rag_master.md — Module 2, mục 2.2, strategy #4
 """
+
+from __future__ import annotations
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 

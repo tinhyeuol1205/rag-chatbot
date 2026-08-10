@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Dense Search — Tìm kiếm bằng vector similarity (cosine).
 
@@ -14,6 +12,8 @@ Cách hoạt động:
 Nhược điểm: Kém với từ khóa CHÍNH XÁC
   "TC-456" (mã ticket) → dense search không hiểu, coi như random text
 """
+
+from __future__ import annotations
 
 from core import get_logger
 from core.config import settings

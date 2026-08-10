@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Qdrant Vector Database Connector — Singleton Pattern.
 
@@ -17,6 +15,8 @@ Usage:
     qdrant = QdrantConnector()
     qdrant.search(collection_name="child_chunks", query_vector=[...], limit=5)
 """
+
+from __future__ import annotations
 
 from threading import Lock
 
@@ -154,8 +154,6 @@ class QdrantConnector:
 
         qdrant-client v1.18+: dùng query_points() thay vì search().
         """
-        from qdrant_client.models import models
-
         result = self.client.query_points(
             collection_name=collection_name,
             query=query_vector,

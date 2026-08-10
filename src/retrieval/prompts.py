@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Prompt Templates cho RAG pipeline.
 
@@ -9,6 +7,7 @@ System prompt hướng dẫn LLM:
   - Nói "không biết" khi context không chứa câu trả lời
 """
 
+from __future__ import annotations
 SYSTEM_PROMPT = """You are an internal company assistant. Your role is to answer questions
 based ONLY on the provided context from company documents.
 

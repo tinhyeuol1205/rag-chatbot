@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Hybrid Search + Reciprocal Rank Fusion (RRF) ★ — Kỹ thuật RAG #1.
 
@@ -31,6 +29,8 @@ Tại sao dùng rank thay vì score?
 
 Tham khảo: rag_master.md — Module 4, mục 4.2
 """
+
+from __future__ import annotations
 
 from core import get_logger
 from core.config import settings

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Multi-Query Expansion ★ — Kỹ thuật RAG #3.
 
@@ -17,6 +15,8 @@ Giải pháp:
 
 Tham khảo: rag_master.md — Module 4, mục 4.1, technique #1
 """
+
+from __future__ import annotations
 
 import re
 

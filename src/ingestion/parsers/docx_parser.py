@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """DOCX Parser — Đọc file Word (.docx), trích xuất text."""
+
+from __future__ import annotations
 
 from pathlib import Path
 

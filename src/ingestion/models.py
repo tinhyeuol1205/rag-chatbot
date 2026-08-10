@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Data Models cho Ingestion Pipeline.
 
@@ -9,6 +7,8 @@ Mỗi model đại diện cho dữ liệu tại 1 giai đoạn khác nhau:
 Pattern: Giống llm-twin-course (models/raw.py → clean.py → chunk.py → embedded_chunk.py)
 Mỗi bước xử lý nhận model A và trả về model B.
 """
+
+from __future__ import annotations
 
 import hashlib
 import uuid

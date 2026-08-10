@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Test Dataset — Bộ câu hỏi + ground truth để đánh giá RAG.
 
@@ -13,6 +11,7 @@ Bộ dataset này dùng để:
   3. Đánh giá retrieved context → tính Context Relevance
 """
 
+from __future__ import annotations
 # Bộ test set — xây dựng từ 2 sample docs (company_policy.md + engineering_handbook.md)
 EVAL_DATASET = [
     # ----- Company Policy -----

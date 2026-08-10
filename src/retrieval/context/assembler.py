@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Context Assembler — Tổng hợp context + Lost-in-Middle reorder.
 
@@ -22,6 +20,8 @@ Giải pháp: Sắp xếp lại theo pattern "zigzag":
 
 Tham khảo: rag_master.md — Module 5, mục 5.2
 """
+
+from __future__ import annotations
 
 from core import get_logger
 from core.config import settings

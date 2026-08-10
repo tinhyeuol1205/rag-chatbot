@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 FastAPI Backend — REST API + SSE streaming.
 
@@ -11,6 +9,8 @@ Endpoints:
 Chạy bằng: make run-api
 Hoặc:      uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 """
+
+from __future__ import annotations
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware

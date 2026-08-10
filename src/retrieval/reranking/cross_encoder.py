@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Cross-Encoder Reranking ★ — Kỹ thuật RAG #2.
 
@@ -28,6 +26,8 @@ Model: BAAI/bge-reranker-v2-m3 — top đầu MTEB reranking benchmark
 
 Tham khảo: rag_master.md — Module 5, mục 5.1
 """
+
+from __future__ import annotations
 
 from functools import lru_cache
 from threading import Lock

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 HyDE — Hypothetical Document Embedding ★ — Kỹ thuật RAG #4.
 
@@ -22,6 +20,8 @@ Giải pháp:
 
 Tham khảo: rag_master.md — Module 4, mục 4.1, technique #2
 """
+
+from __future__ import annotations
 
 from core import get_logger
 from core.llm import get_llm_service

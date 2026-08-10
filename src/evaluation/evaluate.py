@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Evaluation Entry Point — Chạy đánh giá RAG pipeline.
 
@@ -12,6 +10,11 @@ Luồng xử lý:
   3. Tính RAG Triad metrics (RAGAS hoặc simple fallback)
   4. In report
 """
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
 
 from core import get_logger
 from evaluation.dataset import EVAL_DATASET
@@ -28,47 +31,52 @@ def main():
     results: list[EvalResult] = []
 
     for i, sample in enumerate(EVAL_DATASET, 1):
-        question = sample["question"]
-        ground_truth = sample["ground_truth"]
-
+        question, ground_truth = sample["question"], sample["ground_truth"]
         logger.info(f"[{i}/{len(EVAL_DATASET)}] Evaluating", question=question[:60])
-
         try:
-            # Chạy qua RAG pipeline
-            answer = retriever.query(question, stream=False)
-
-            # Thu thập contexts (từ retriever internals)
-            # Simplified: chạy search riêng để lấy contexts
-            expanded = retriever.expander.expand(question)
-            search_results = retriever.searcher.search(question)
-            contexts = [r["content"] for r in search_results[:5]]
-
+            # ★ Chỉ chạy pipeline 1 LẦN (bug P0-4): contexts là context THẬT đã đưa vào LLM
+            result = retriever.query_with_context(question)
             results.append(EvalResult(
                 question=question,
-                answer=answer,
+                answer=result.answer,
                 ground_truth=ground_truth,
-                contexts=contexts,
+                contexts=result.contexts,
             ))
-
-            logger.info(
-                f"[{i}/{len(EVAL_DATASET)}] Done",
-                answer_preview=answer[:80],
-            )
-
+            logger.info(f"[{i}/{len(EVAL_DATASET)}] Done",
+                        answer_preview=result.answer[:80],
+                        num_contexts=len(result.contexts))
         except Exception as e:
-            logger.error(f"[{i}/{len(EVAL_DATASET)}] Failed", error=str(e))
+            logger.exception(f"[{i}/{len(EVAL_DATASET)}] Failed")
             results.append(EvalResult(
-                question=question,
-                answer=f"ERROR: {e}",
-                ground_truth=ground_truth,
-                contexts=[],
+                question=question, answer=f"ERROR: {e}",
+                ground_truth=ground_truth, contexts=[],
             ))
 
     # Tính metrics
     scores = evaluate_with_ragas(results)
 
-    # In report
+    # In report + lưu kết quả để so sánh giữa các lần tune
     _print_report(results, scores)
+    _save_results(results, scores)
+
+
+def _save_results(results: list[EvalResult], scores: dict,
+                  out_dir: str = "data/eval_runs") -> None:
+    """Lưu kết quả để so sánh giữa các lần chạy."""
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    payload = {
+        "scores": {k: (float(v) if isinstance(v, (int, float)) else str(v))
+                   for k, v in scores.items()},
+        "samples": [
+            {"question": r.question, "answer": r.answer,
+             "ground_truth": r.ground_truth, "num_contexts": len(r.contexts),
+             "contexts": r.contexts}
+            for r in results
+        ],
+    }
+    path = Path(out_dir) / "latest.json"
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info("Eval results saved", path=str(path))
 
 
 def _print_report(results: list[EvalResult], scores: dict):

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Parser Dispatcher — Tự động chọn parser phù hợp theo đuôi file.
 
@@ -7,6 +5,8 @@ Pattern: Dispatcher (giống llm-twin-course/data_crawling/dispatcher.py)
   CrawlerDispatcher nhận URL  → chọn MediumCrawler / GithubCrawler
   ParserDispatcher  nhận Path → chọn PDFParser / MarkdownParser
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 
