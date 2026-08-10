@@ -63,11 +63,12 @@ def chat_or_raise(query: str) -> str:
     return get_retriever().query(query, stream=False)
 
 
-def chat_stream(query: str):
+def chat_stream(query: str, history: list | None = None):
     """Xử lý câu hỏi và trả về câu trả lời (streaming — từng token). Không raise.
 
     Args:
         query: Câu hỏi của user
+        history: Lịch sử chat (Gradio format) cho multi-turn — condense trước khi retrieval
 
     Yields:
         Từng token của câu trả lời
@@ -77,10 +78,32 @@ def chat_stream(query: str):
         return
 
     try:
-        yield from get_retriever().query(query, stream=True)
+        yield from get_retriever().query(
+            query, stream=True, history=_normalize_history(history or [])
+        )
     except RAGChatbotError as e:
         logger.exception("Chat stream failed (known error)")
         yield f"⚠️ {e}"
     except Exception:
         logger.exception("Chat stream failed (unexpected)")
         yield USER_FACING_ERROR
+
+
+def _normalize_history(chat_history: list) -> list[tuple[str, str]]:
+    """Chuẩn hoá format history của Gradio về list[(user, assistant)].
+
+    Gradio 4.x: [[user, bot], ...] (tuples)
+    Gradio 5.x+: [{'role', 'content'}, ...] (messages dict)
+    """
+    if not chat_history:
+        return []
+    if isinstance(chat_history[0], dict):
+        pairs, pending = [], None
+        for msg in chat_history:
+            if msg.get("role") == "user":
+                pending = msg.get("content", "")
+            elif msg.get("role") == "assistant" and pending is not None:
+                pairs.append((pending, msg.get("content", "")))
+                pending = None
+        return pairs
+    return [(u, a) for u, a in chat_history if u and a]

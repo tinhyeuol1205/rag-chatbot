@@ -42,6 +42,7 @@ from core.llm import get_llm_service
 from retrieval.context.assembler import ContextAssembler
 from retrieval.context.parent_resolver import ParentResolver
 from retrieval.prompts import RAG_USER_PROMPT, SYSTEM_PROMPT
+from retrieval.query_transform.condense import QueryCondenser
 from retrieval.query_transform.hyde import HyDEGenerator
 from retrieval.query_transform.multi_query import MultiQueryExpander
 from retrieval.reranking.cross_encoder import CrossEncoderReranker
@@ -77,9 +78,11 @@ class RAGRetriever:
         self.parent_resolver = ParentResolver()
         self.assembler = ContextAssembler()
         self.llm = get_llm_service()
+        self.condenser = QueryCondenser()
 
-    def retrieve(self, user_query: str) -> tuple[list[dict], str, str, list[str]]:
-        """Chạy toàn bộ retrieval, trả về (resolved_docs, context_text, sources_text, expanded).
+    def retrieve(self, user_query: str, history: list[tuple[str, str]] | None = None
+                 ) -> tuple[list[dict], str, str, list[str], str]:
+        """Chạy toàn bộ retrieval, trả về (resolved_docs, context, sources, expanded, search_query).
 
         Tách riêng khỏi generate để evaluation lấy được context THẬT đã đưa vào LLM
         (bug P0-4: trước đây evaluate tự search riêng → contexts là child chunk,
@@ -87,16 +90,20 @@ class RAGRetriever:
         """
         logger.info("RAG query started", query=user_query[:80])
 
+        # ⓿ Condense — resolve đại từ/tham chiếu từ history TRƯỚC khi retrieval
+        search_query = self.condenser.condense(user_query, history or [])
+
         # ① + ② Song song hoá: expand và HyDE KHÔNG phụ thuộc nhau → tiết kiệm 1 LLM call
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=2) as pool:
-            f_expand = pool.submit(self.expander.expand, user_query)
-            f_hyde = pool.submit(self.hyde.generate_embedding, user_query)
+            f_expand = pool.submit(self.expander.expand, search_query)
+            f_hyde = pool.submit(self.hyde.generate_embedding, search_query)
             expanded_queries = f_expand.result()
             hyde_vector = f_hyde.result()
 
         # ③ Hybrid Search — thu từng result_list RIÊNG BIỆT (không gộp chung)
-        result_lists = [self.searcher.search(user_query, hyde_vector=hyde_vector)]
+        # ★ Dùng search_query (đã condense) cho MỌI search — kể cả query đầu tiên
+        result_lists = [self.searcher.search(search_query, hyde_vector=hyde_vector)]
         for eq in expanded_queries:
             result_lists.append(self.searcher.search(eq))
 
@@ -110,8 +117,8 @@ class RAGRetriever:
             top_n_hits=unique[0]["n_hits"] if unique else 0,
         )
 
-        # ⑤ Cross-Encoder Reranking
-        top_chunks = self.reranker.rerank(user_query, unique)
+        # ⑤ Cross-Encoder Reranking — rerank theo search_query (đã condense)
+        top_chunks = self.reranker.rerank(search_query, unique)
 
         # ⑥ Parent Resolution
         resolved = self.parent_resolver.resolve(top_chunks)
@@ -119,34 +126,38 @@ class RAGRetriever:
         # ⑦ Context Assembly
         context_text, sources_text = self.assembler.assemble(resolved)
 
-        return resolved, context_text, sources_text, expanded_queries
+        return resolved, context_text, sources_text, expanded_queries, search_query
 
-    def query(self, user_query: str, stream: bool = False):
+    def query(self, user_query: str, stream: bool = False,
+              history: list[tuple[str, str]] | None = None):
         """Xử lý câu hỏi qua toàn bộ RAG pipeline.
 
         Args:
             user_query: Câu hỏi của user
             stream: True → trả về generator (SSE), False → trả về string
+            history: List các (user, assistant) cho multi-turn — condense trước khi retrieval
 
         Returns:
             str hoặc generator — câu trả lời từ LLM
         """
-        _, context, sources, _ = self.retrieve(user_query)
+        _, context, sources, _, search_query = self.retrieve(user_query, history=history)
 
         # ⑧ LLM Generation — short-circuit nếu context rỗng (khỏi tốn LLM call vô ích)
         if not context.strip():
             logger.warning("Empty context — skipping LLM call", query=user_query[:80])
             return iter([NO_CONTEXT_MSG]) if stream else NO_CONTEXT_MSG
 
+        # ★ Dùng search_query (đã condense) cho generate — để LLM thấy câu hỏi độc lập,
+        #   không phải câu gốc chứa đại từ mơ hồ ("change it?")
         if stream:
-            return self._generate_stream(user_query, context, sources)
+            return self._generate_stream(search_query, context, sources)
         else:
-            return self._generate(user_query, context, sources)
+            return self._generate(search_query, context, sources)
 
     def query_with_context(self, user_query: str) -> RAGResult:
         """Dùng cho evaluation — trả về ĐÚNG context đã đưa vào LLM (bug P0-4)."""
-        resolved, context, sources, expanded = self.retrieve(user_query)
-        answer = (self._generate(user_query, context, sources)
+        resolved, context, sources, expanded, search_query = self.retrieve(user_query)
+        answer = (self._generate(search_query, context, sources)
                   if context.strip() else NO_CONTEXT_MSG)
         return RAGResult(
             answer=answer,

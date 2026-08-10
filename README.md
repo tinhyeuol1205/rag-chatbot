@@ -125,8 +125,8 @@ Metrics:
   (Anh, Việt). CJK chưa hỗ trợ. Dense search thì đa ngôn ngữ bình thường.
 - **Latency:** trên CPU, mỗi câu hỏi mất vài giây đến vài chục giây (2 LLM call +
   cross-encoder rerank). Xem `RERANKER_MODEL_ID` trong `.env` để đổi sang model nhẹ hơn.
-- **Multi-turn:** chưa hỗ trợ. Mỗi câu hỏi là một phiên độc lập — câu hỏi follow-up dùng
-  đại từ ("cái đó", "them") sẽ không được resolve.
+- **Multi-turn:** hỗ trợ cơ bản qua Query Condensation (viết lại follow-up thành câu hỏi
+  độc lập). Giới hạn: chỉ nhìn 3 lượt gần nhất, tốn thêm 1 LLM call mỗi câu hỏi có history.
 - **BM25 index:** build 1 lần trong process. Nếu ingest ở terminal khác với server đang
   chạy, **phải restart server** để BM25 thấy dữ liệu mới. Dense search thì thấy ngay.
 - **Scale:** BM25 giữ toàn bộ corpus trong RAM. Không phù hợp với > ~100k chunk.
