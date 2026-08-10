@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Custom Exceptions cho RAG Chatbot.
 
@@ -13,7 +11,7 @@ Usage:
     raise ParsingError("Cannot parse file: corrupted PDF")
 """
 
-
+from __future__ import annotations
 class RAGChatbotError(Exception):
     """Base exception — tất cả lỗi trong project kế thừa từ đây."""
     pass

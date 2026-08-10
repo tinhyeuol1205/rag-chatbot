@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 """
 Base Parser — Abstract interface cho tất cả document parsers.
 
 Mọi parser (PDF, MD, DOCX) đều phải implement method parse().
 Đây là Strategy Pattern: cùng interface, khác implementation.
 """
+
+from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path

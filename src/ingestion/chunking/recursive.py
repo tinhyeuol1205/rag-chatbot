@@ -1,7 +1,8 @@
-from __future__ import annotations
-
 """
 Recursive Character Chunking — Chiến lược chunking cơ bản.
+
+⚠️ KHÔNG dùng trong ingestion pipeline — pipeline dùng parent_child_chunk().
+Giữ lại để minh hoạ chiến lược chunking cơ bản (đối chiếu với Parent-Child).
 
 Cách hoạt động:
   1. Thử chia theo "\n\n" (paragraph) trước
@@ -14,6 +15,8 @@ Cách hoạt động:
 
 Tham khảo: rag_master.md — Module 2, mục 2.2, strategy #2
 """
+
+from __future__ import annotations
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 

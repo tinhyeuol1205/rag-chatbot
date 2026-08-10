@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Sparse Search (BM25) — Tìm kiếm bằng từ khóa.
 
@@ -20,6 +18,8 @@ Giới hạn: chỉ hoạt động tốt với ngôn ngữ có space phân từ 
 
 Tham khảo: rag_master.md — Module 3, mục 3.1 (Sparse Embeddings)
 """
+
+from __future__ import annotations
 
 import re
 

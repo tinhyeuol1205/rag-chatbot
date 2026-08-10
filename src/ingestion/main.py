@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 """
 Entry point cho Ingestion Pipeline.
 
 Chạy bằng: make ingest
 Hoặc:      cd src && python -m ingestion.main
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 

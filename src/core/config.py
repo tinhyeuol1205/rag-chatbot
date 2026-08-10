@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Central configuration — Tất cả settings đọc từ file .env
 
@@ -12,6 +10,8 @@ Usage:
     from core.config import settings
     print(settings.OPENAI_API_KEY)
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 
@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     # --- API ---
     CORS_ORIGINS: list[str] = ["http://localhost:7860", "http://127.0.0.1:7860"]
     API_KEY: str = ""     # để trống = tắt auth (dev); set giá trị = bật auth
+
+    # --- Logging ---
+    LOG_LEVEL: str = "INFO"     # DEBUG / INFO / WARNING / ERROR
+    LOG_JSON: bool = False      # True → JSON output (cho ELK/Datadog)
 
     # --- RAG Parameters ---
     TOP_K: int = 20          # Lấy bao nhiêu kết quả ban đầu (trước reranking)

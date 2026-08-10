@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 LLM Service — Unified interface cho nhiều LLM providers.
 
@@ -20,6 +18,8 @@ Usage:
     for token in llm.generate_stream("Hello", system="You are helpful."):
         print(token, end="")
 """
+
+from __future__ import annotations
 
 from abc import ABC, abstractmethod
 

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Ingestion Pipeline Orchestrator — Nối tất cả lại.
 
@@ -17,6 +15,8 @@ Usage:
     pipeline = IngestionPipeline()
     pipeline.run("data/sample_docs/")
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Chat Orchestrator — Kết nối RAGRetriever với API/UI layer.
 
@@ -8,6 +6,8 @@ Tách riêng khỏi retriever để:
 - Format response cho API/UI
 - Handle errors gracefully
 """
+
+from __future__ import annotations
 
 from core import get_logger
 from core.errors import RAGChatbotError

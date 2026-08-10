@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """PDF Parser — Đọc file PDF, trích xuất text theo từng trang."""
+
+from __future__ import annotations
 
 from pathlib import Path
 

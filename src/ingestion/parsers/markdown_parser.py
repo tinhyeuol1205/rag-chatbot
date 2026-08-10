@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Markdown Parser — Đọc file .md, chia theo headers (## hoặc #)."""
+
+from __future__ import annotations
 
 import re
 from pathlib import Path

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Embedding Service — Chuyển text thành vector (384 dimensions).
 
@@ -19,6 +17,8 @@ Usage:
     vectors = service.embed(["Hello world", "Another text"])
     # vectors.shape = (2, 384)
 """
+
+from __future__ import annotations
 
 from functools import lru_cache
 
