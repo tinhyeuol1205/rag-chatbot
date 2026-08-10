@@ -82,6 +82,7 @@ class DenseSearcher:
                 "parent_id": r.payload.get("parent_id"),
                 "file_name": r.payload.get("file_name", ""),
                 "section_title": r.payload.get("section_title", ""),
+                "page_number": r.payload.get("page_number"),   # ★ THÊM
                 "source": "dense",  # Đánh dấu nguồn tìm kiếm
             })
         return formatted

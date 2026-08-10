@@ -11,8 +11,12 @@ Mỗi bước xử lý nhận model A và trả về model B.
 """
 
 import hashlib
+import uuid
 
 from pydantic import BaseModel
+
+# Namespace cố định cho project — đảm bảo ID deterministic giữa các lần chạy
+_NAMESPACE = uuid.UUID("6f9619ff-8b86-d011-b42d-00cf4fc964ff")
 
 
 class DocumentMetadata(BaseModel):
@@ -39,8 +43,9 @@ class Chunk(BaseModel):
     """
     Sau khi chunking → Chunk.
     Mỗi Chunk có:
-    - chunk_id: ID duy nhất (MD5 hash) — dùng làm Qdrant point ID
+    - chunk_id: UUIDv5 deterministic — dùng làm Qdrant point ID
     - parent_id: Link đến parent chunk (cho Parent-Child Retrieval)
+    - position: vị trí trong file ("docIdx:parentIdx[:childIdx]") — chống collision
     - is_parent: True nếu đây là parent chunk (chunk lớn, chỉ lưu text)
     """
 
@@ -48,6 +53,7 @@ class Chunk(BaseModel):
     content: str
     parent_id: str | None = None
     is_parent: bool = False
+    position: str = ""
     metadata: DocumentMetadata
 
     def model_post_init(self, __context) -> None:
@@ -56,11 +62,16 @@ class Chunk(BaseModel):
             self.chunk_id = self._generate_id()
 
     def _generate_id(self) -> str:
-        """Tạo ID duy nhất = MD5(content + file_name).
-        Deterministic: cùng content + file → cùng ID (idempotent khi re-ingest).
+        """UUIDv5 deterministic từ (file, vị trí, TOÀN BỘ content).
+
+        - Dùng full content → không collision do prefix giống nhau (bug P2-5)
+        - Kèm position → 2 đoạn text trùng nhau ở 2 vị trí vẫn là 2 chunk
+        - Trả UUID chuẩn → Qdrant nhận trực tiếp, không cần normalize dấu '-'
+        - Deterministic: cùng input → cùng ID (idempotent khi re-ingest content không đổi)
         """
-        key = f"{self.content[:200]}:{self.metadata.file_name}"
-        return hashlib.md5(key.encode()).hexdigest()
+        digest = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
+        key = f"{self.metadata.source_path or self.metadata.file_name}|{self.position}|{digest}"
+        return str(uuid.uuid5(_NAMESPACE, key))
 
 
 class EmbeddedChunk(BaseModel):

@@ -18,9 +18,22 @@ class MarkdownParser(BaseParser):
 
         text = file_path.read_text(encoding="utf-8")
 
-        # Chia theo header cấp 1 hoặc 2 (# hoặc ##)
-        # Regex: tìm dòng bắt đầu bằng # (sau newline)
-        sections = re.split(r"\n(?=#{1,2}\s)", text)
+        # Split theo header cấp 1-3 (#, ##, ###), BỎ QUA các dòng # nằm trong
+        # fenced code block (```...```) — bug P1-2: # trong code bị split sai,
+        # và ### không được tách section.
+        in_fence = False
+        sections: list[str] = []
+        current: list[str] = []
+        for line in text.split("\n"):
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
+            is_header = (not in_fence) and re.match(r"#{1,3}\s", line)
+            if is_header and current:
+                sections.append("\n".join(current))
+                current = []
+            current.append(line)
+        if current:
+            sections.append("\n".join(current))
 
         documents = []
         for section in sections:
@@ -37,7 +50,8 @@ class MarkdownParser(BaseParser):
                     content=content,
                     metadata=DocumentMetadata(
                         file_name=file_path.name,
-                        file_type="md",
+                        # ★ .txt ≠ md (dispatcher map .txt → MarkdownParser)
+                        file_type=file_path.suffix.lstrip(".").lower() or "md",
                         section_title=section_title,
                         source_path=str(file_path),
                     ),
