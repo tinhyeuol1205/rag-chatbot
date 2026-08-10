@@ -32,6 +32,9 @@ logger = get_logger(__name__)
 def parent_child_chunk(documents: list[RawDocument]) -> tuple[list[Chunk], list[Chunk]]:
     """Tạo parent chunks và child chunks từ danh sách documents.
 
+    Chunk theo TỪNG document (1 section MD / 1 trang PDF) để giữ nguyên
+    section_title và page_number cho citation (bug P1-2).
+
     Args:
         documents: Danh sách RawDocument (từ parser)
 
@@ -40,66 +43,65 @@ def parent_child_chunk(documents: list[RawDocument]) -> tuple[list[Chunk], list[
         - parent_chunks: lưu vào Qdrant payload-only collection
         - child_chunks: embed + lưu vào Qdrant vector collection
     """
+    if not documents:
+        return [], []
 
-    # --- Bước 1: Gộp tất cả documents thành 1 text lớn ---
-    # (vì 1 PDF có nhiều pages, ta muốn chunk xuyên suốt pages)
-    full_text = "\n\n".join(doc.content for doc in documents)
-    base_metadata = documents[0].metadata if documents else DocumentMetadata(
-        file_name="unknown", file_type="unknown"
-    )
-
-    # --- Bước 2: Tạo PARENT chunks (lớn) ---
+    # Splitters — tạo 1 lần, dùng cho mọi document
     parent_splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.PARENT_CHUNK_SIZE,       # 2000 chars
         chunk_overlap=settings.PARENT_CHUNK_OVERLAP,  # 200 chars overlap
         separators=["\n\n", "\n", ". ", " ", ""],
     )
-    parent_texts = parent_splitter.split_text(full_text)
-
-    parent_chunks = []
-    for i, text in enumerate(parent_texts):
-        parent_chunks.append(
-            Chunk(
-                content=text,
-                is_parent=True,
-                parent_id=None,  # Parent không có parent
-                metadata=DocumentMetadata(
-                    file_name=base_metadata.file_name,
-                    file_type=base_metadata.file_type,
-                    source_path=base_metadata.source_path,
-                    section_title=f"Section {i + 1}",
-                ),
-            )
-        )
-
-    # --- Bước 3: Tạo CHILD chunks (nhỏ) từ mỗi parent ---
     child_splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.CHILD_CHUNK_SIZE,        # 400 chars
         chunk_overlap=settings.CHILD_CHUNK_OVERLAP,   # 50 chars overlap
         separators=["\n\n", "\n", ". ", " ", ""],
     )
 
-    child_chunks = []
-    for parent in parent_chunks:
-        child_texts = child_splitter.split_text(parent.content)
+    parent_chunks: list[Chunk] = []
+    child_chunks: list[Chunk] = []
 
-        for j, text in enumerate(child_texts):
-            child_chunks.append(
-                Chunk(
-                    content=text,
-                    is_parent=False,
-                    parent_id=parent.chunk_id,  # ★ Link đến parent
-                    metadata=DocumentMetadata(
-                        file_name=parent.metadata.file_name,
-                        file_type=parent.metadata.file_type,
-                        source_path=parent.metadata.source_path,
-                        section_title=parent.metadata.section_title,
-                    ),
-                )
+    # ★ Chunk theo TỪNG document → giữ metadata của document đó
+    for doc_idx, doc in enumerate(documents):
+        md = doc.metadata
+        for p_idx, parent_text in enumerate(parent_splitter.split_text(doc.content)):
+            # section_title: ưu tiên cái parser trích được; chỉ fallback khi thiếu
+            if md.section_title:
+                title = md.section_title
+            elif md.page_number is not None:
+                title = f"Page {md.page_number}"
+            else:
+                title = f"Section {doc_idx + 1}"
+
+            parent = Chunk(
+                content=parent_text,
+                is_parent=True,
+                parent_id=None,  # Parent không có parent
+                position=f"{doc_idx}:{p_idx}",       # ★ chống collision (P2-5)
+                metadata=DocumentMetadata(
+                    file_name=md.file_name,
+                    file_type=md.file_type,
+                    page_number=md.page_number,      # ★ GIỮ
+                    section_title=title,             # ★ GIỮ
+                    source_path=md.source_path,
+                ),
             )
+            parent_chunks.append(parent)
+
+            for c_idx, child_text in enumerate(child_splitter.split_text(parent_text)):
+                child_chunks.append(
+                    Chunk(
+                        content=child_text,
+                        is_parent=False,
+                        parent_id=parent.chunk_id,   # ★ Link đến parent
+                        position=f"{doc_idx}:{p_idx}:{c_idx}",
+                        metadata=parent.metadata.model_copy(),   # thừa hưởng metadata thật
+                    )
+                )
 
     logger.info(
         "Parent-Child chunking done",
+        source_docs=len(documents),
         parents=len(parent_chunks),
         children=len(child_chunks),
         avg_children_per_parent=round(len(child_chunks) / max(len(parent_chunks), 1), 1),

@@ -19,7 +19,15 @@ Usage:
 """
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    FilterSelector,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 
 from core.config import settings
 from core.logger import get_logger
@@ -92,6 +100,40 @@ class QdrantConnector:
             points=points,
         )
         logger.info("Upserted points", collection=collection_name, count=len(points))
+
+    def delete_by_file_name(self, collection_name: str, file_name: str) -> None:
+        """Xoá mọi point của 1 file — gọi TRƯỚC khi ingest lại file đó.
+
+        Chống chunk rác vĩnh viễn (bug P1-6): content đổi → chunk_id đổi →
+        point cũ không ai xoá. Fix: xoá toàn bộ point theo file_name trước khi
+        ghi lại file.
+        """
+        if not self._collection_exists(collection_name):
+            return
+        self.client.delete(
+            collection_name=collection_name,
+            points_selector=FilterSelector(
+                filter=Filter(must=[
+                    FieldCondition(key="file_name", match=MatchValue(value=file_name))
+                ])
+            ),
+            wait=True,
+        )
+        logger.info("Deleted existing points for file",
+                    collection=collection_name, file=file_name)
+
+    def create_payload_index(self, collection_name: str, field_name: str) -> None:
+        """Index cho payload field — bắt buộc để filter/delete-by-filter chạy nhanh."""
+        from qdrant_client.models import PayloadSchemaType
+        try:
+            self.client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field_name,
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+            logger.info("Created payload index", collection=collection_name, field=field_name)
+        except Exception as e:      # index đã tồn tại → bỏ qua
+            logger.debug("Payload index skipped", field=field_name, error=str(e))
 
     # ----- Read Operations -----
 

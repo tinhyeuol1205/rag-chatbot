@@ -56,11 +56,9 @@ class ParentResolver:
         parent_points = self.qdrant.get_by_ids(settings.PARENT_COLLECTION, parent_ids)
 
         # Tạo lookup: parent_id → parent content
-        # ★ Normalize: bỏ dấu '-' vì Qdrant tự convert MD5 hex → UUID format
-        #   Qdrant trả về: "249850ae-83ee-caac-ad59-5b9d037dd868" (có dấu -)
-        #   Child payload:  "249850ae83eecaacad595b9d037dd868"     (không dấu -)
+        # Cả 2 phía đều là UUID canonical (PR 3 / P2-5) → không cần normalize dấu '-'
         parent_map = {
-            str(point.id).replace("-", ""): point.payload
+            str(point.id): point.payload
             for point in parent_points
         }
 
@@ -71,7 +69,7 @@ class ParentResolver:
         deduped = 0
 
         for doc in child_results:
-            pid = str(doc.get("parent_id") or "").replace("-", "")
+            pid = str(doc.get("parent_id") or "")
 
             if not pid:
                 # Child không có parent → giữ nguyên child

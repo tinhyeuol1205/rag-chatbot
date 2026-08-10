@@ -60,6 +60,10 @@ class IngestionPipeline:
         for file_name, documents in all_documents.items():
             logger.info("Processing file", file=file_name, raw_docs=len(documents))
 
+            # ★ Bước 1.5: dọn chunk cũ của file này (idempotent thật sự — bug P1-6)
+            self.qdrant.delete_by_file_name(settings.CHILD_COLLECTION, file_name)
+            self.qdrant.delete_by_file_name(settings.PARENT_COLLECTION, file_name)
+
             # Bước 2: Parent-Child Chunking
             parent_chunks, child_chunks = parent_child_chunk(documents)
 
@@ -87,15 +91,22 @@ class IngestionPipeline:
         """Tạo 2 collections trong Qdrant nếu chưa tồn tại."""
         self.qdrant.create_vector_collection(settings.CHILD_COLLECTION)
         self.qdrant.create_payload_collection(settings.PARENT_COLLECTION)
+        # index để delete-by-filter và metadata filtering hoạt động
+        for coll in (settings.CHILD_COLLECTION, settings.PARENT_COLLECTION):
+            self.qdrant.create_payload_index(coll, "file_name")
 
     def _parse_all_files(self, data_path: Path) -> dict[str, list[RawDocument]]:
         """Scan thư mục, parse tất cả files hỗ trợ.
 
         Returns:
-            Dict mapping: file_name → list[RawDocument]
+            Dict mapping: relative_path → list[RawDocument]
+            Dùng relative path làm key để 2 file cùng tên ở 2 thư mục con
+            không đè nhau (bug P1-6).
         """
         supported = ParserDispatcher.supported_extensions()
-        files = [f for f in data_path.rglob("*") if f.suffix.lower() in supported]
+        # ★ thêm is_file() — rglob("*") cũng trả về thư mục, làm parser crash
+        files = [f for f in data_path.rglob("*")
+                 if f.is_file() and f.suffix.lower() in supported]
 
         if not files:
             logger.warning("No supported files found", path=str(data_path), supported=supported)
@@ -105,11 +116,23 @@ class IngestionPipeline:
 
         result: dict[str, list[RawDocument]] = {}
         for file_path in sorted(files):
-            parser = ParserDispatcher.get_parser(file_path)
-            documents = parser.parse(file_path)
+            rel = file_path.relative_to(data_path).as_posix()   # ★ unique key
+            try:
+                parser = ParserDispatcher.get_parser(file_path)
+                documents = parser.parse(file_path)
+            except Exception:
+                # ★ 1 file hỏng KHÔNG được giết cả pipeline
+                logger.exception("Failed to parse file, skipping", file=rel)
+                continue
             if documents:
-                result[file_path.name] = documents
+                # ★ đồng bộ file_name với key dùng để delete (bug P1-6)
+                for d in documents:
+                    d.metadata.file_name = rel
+                result[rel] = documents
+            else:
+                logger.warning("Parser returned no documents", file=rel)
 
+        logger.info("Parsed files", found=len(files), parsed=len(result))
         return result
 
     def _embed_chunks(self, chunks: list[Chunk]) -> list[EmbeddedChunk]:
@@ -151,6 +174,7 @@ class IngestionPipeline:
                     "file_type": chunk.metadata.file_type,
                     "source_path": chunk.metadata.source_path,
                     "section_title": chunk.metadata.section_title,
+                    "page_number": chunk.metadata.page_number,   # ★ THÊM
                 },
             )
             for chunk in chunks
@@ -173,6 +197,7 @@ class IngestionPipeline:
                     "file_type": chunk.metadata.file_type,
                     "source_path": chunk.metadata.source_path,
                     "section_title": chunk.metadata.section_title,
+                    "page_number": chunk.metadata.page_number,   # ★ THÊM
                 },
             )
             for chunk in chunks
