@@ -32,24 +32,24 @@ EXAMPLE_QUESTIONS = [
 
 
 def respond(message: str, chat_history: list):
-    """Xử lý message từ user, trả về streaming response.
+    """Xử lý message từ user, trả về streaming response (multi-turn).
 
     Args:
         message: Tin nhắn mới từ user
-        chat_history: Lịch sử chat (Gradio format)
+        chat_history: Lịch sử chat (Gradio format) — dùng để condense follow-up
 
     Yields:
         Từng token để Gradio hiển thị streaming
     """
     # Streaming: ghép từng token vào response
     response = ""
-    for token in chat_stream(message):
+    for token in chat_stream(message, history=chat_history):
         response += token
         yield response
 
 
 def create_ui() -> gr.ChatInterface:
-    """Tạo Gradio ChatInterface (Gradio 6.x API)."""
+    """Tạo Gradio ChatInterface."""
 
     demo = gr.ChatInterface(
         fn=respond,

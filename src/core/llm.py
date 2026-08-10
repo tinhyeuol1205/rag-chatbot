@@ -3,7 +3,7 @@ LLM Service — Unified interface cho nhiều LLM providers.
 
 Hỗ trợ 2 providers:
   - "openai": OpenAI API / NVIDIA NIM / bất kỳ OpenAI-compatible API
-  - "gemini": Google Gemini Interactions API (google-genai SDK)
+  - "gemini": Google Gemini Interactions API (google-genai SDK 2.x)
 
 Chọn provider bằng biến LLM_PROVIDER trong .env:
   LLM_PROVIDER=openai   → dùng OpenAI client
@@ -25,6 +25,7 @@ from abc import ABC, abstractmethod
 
 from core import get_logger
 from core.config import settings
+from core.errors import ConfigurationError
 
 logger = get_logger(__name__)
 
@@ -128,14 +129,15 @@ class OpenAILLMService(BaseLLMService):
 
 
 class GeminiLLMService(BaseLLMService):
-    """LLM provider dùng Google Gemini Interactions API.
+    """LLM provider dùng Google Gemini Interactions API (google-genai 2.x).
+
+    Verified chạy thật với SDK 2.15.0 + key (xem review/standalone.md P0-2).
 
     Khác biệt so với OpenAI:
-      - system_prompt → truyền vào system_instruction (không nằm trong messages)
-      - user_prompt → truyền vào input
-      - Response: interaction.outputs[-1].text
-
-    Bonus: Multi-turn tự động bằng previous_interaction_id
+      - system_prompt → system_instruction (top-level kwarg, KHÔNG nằm trong messages)
+      - user_prompt → input
+      - Response: interaction.output_text
+      - Config (temperature, max_output_tokens) → generation_config (dict)
     """
 
     def __init__(self):
@@ -149,6 +151,12 @@ class GeminiLLMService(BaseLLMService):
         self._model = settings.GEMINI_MODEL_ID
         logger.info("Gemini LLM initialized", model=self._model)
 
+    def _build_config(self, temperature: float, max_tokens: int) -> dict:
+        return {
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
+
     def generate(
         self,
         user_prompt: str,
@@ -159,17 +167,13 @@ class GeminiLLMService(BaseLLMService):
         kwargs = {
             "model": self._model,
             "input": user_prompt,
+            "generation_config": self._build_config(temperature, max_tokens),
         }
         if system_prompt:
             kwargs["system_instruction"] = system_prompt
 
-        kwargs["generation_config"] = {
-            "temperature": temperature,
-            "max_output_tokens": max_tokens,
-        }
-
         interaction = self._client.interactions.create(**kwargs)
-        return interaction.output_text
+        return (interaction.output_text or "").strip()
 
     def generate_stream(
         self,
@@ -178,23 +182,24 @@ class GeminiLLMService(BaseLLMService):
         temperature: float = 0.1,
         max_tokens: int = 1024,
     ):
-        """Gemini streaming qua Interactions API."""
+        """Gemini streaming qua Interactions API.
 
+        Lưu ý: event 'step.delta' có thể là 'thought_signature' (thinking) — KHÔNG có text,
+        phải lọc bằng `delta.type == 'text'` (code hiện tại đã làm đúng).
+        """
         kwargs = {
             "model": self._model,
             "input": user_prompt,
             "stream": True,
+            "generation_config": self._build_config(temperature, max_tokens),  # ★ THÊM max_tokens
         }
         if system_prompt:
             kwargs["system_instruction"] = system_prompt
 
-        kwargs["generation_config"] = {
-            "temperature": temperature,
-        }
         stream = self._client.interactions.create(**kwargs)
         for event in stream:
             if event.event_type == "step.delta":
-                if event.delta.type == "text":
+                if event.delta.type == "text" and event.delta.text:
                     yield event.delta.text
 
 
@@ -221,8 +226,9 @@ def get_llm_service() -> BaseLLMService:
         elif provider == "openai":
             _llm_instance = OpenAILLMService()
         else:
-            raise ValueError(
-                f"Unknown LLM_PROVIDER: '{provider}'. Use 'openai' or 'gemini'."
+            raise ConfigurationError(
+                f"LLM_PROVIDER='{settings.LLM_PROVIDER}' không hợp lệ. "
+                f"Dùng 'openai' hoặc 'gemini'."
             )
 
         logger.info("LLM Service created", provider=provider)
