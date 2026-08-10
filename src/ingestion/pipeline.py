@@ -83,6 +83,13 @@ class IngestionPipeline:
 
         logger.info("Ingestion pipeline complete")
 
+        # BM25 index (nếu có process nào đang giữ) cần nạp lại corpus mới
+        try:
+            from retrieval.search.sparse import invalidate_bm25_index
+            invalidate_bm25_index()
+        except ImportError:
+            pass    # ingestion không bắt buộc phụ thuộc retrieval
+
     # ================================================================
     # Private methods — từng bước xử lý
     # ================================================================

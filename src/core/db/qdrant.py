@@ -18,6 +18,8 @@ Usage:
     qdrant.search(collection_name="child_chunks", query_vector=[...], limit=5)
 """
 
+from threading import Lock
+
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
@@ -36,30 +38,35 @@ logger = get_logger(__name__)
 
 
 class QdrantConnector:
-    """Singleton connector cho Qdrant vector database."""
+    """Singleton connector cho Qdrant vector database (thread-safe)."""
 
     _instance: "QdrantConnector | None" = None
     _client: QdrantClient | None = None
+    _lock = Lock()
 
     def __new__(cls) -> "QdrantConnector":
-        """Singleton: chỉ tạo instance mới nếu chưa tồn tại."""
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
+        """Singleton thread-safe: chỉ tạo instance mới nếu chưa tồn tại."""
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
         return cls._instance
 
     @property
     def client(self) -> QdrantClient:
-        """Lazy init: chỉ tạo connection khi thực sự cần dùng."""
-        if self._client is None:
-            self._client = QdrantClient(
-                host=settings.QDRANT_HOST,
-                port=settings.QDRANT_PORT,
-            )
-            logger.info(
-                "Connected to Qdrant",
-                host=settings.QDRANT_HOST,
-                port=settings.QDRANT_PORT,
-            )
+        """Lazy init thread-safe: chỉ tạo connection khi thực sự cần dùng."""
+        if self._client is None:            # fast path — không cần lock
+            with self._lock:                # slow path — lấy lock
+                if self._client is None:    # double-check LẠI sau khi có lock
+                    self._client = QdrantClient(
+                        host=settings.QDRANT_HOST,
+                        port=settings.QDRANT_PORT,
+                        timeout=30,         # ★ mặc định có thể treo rất lâu
+                    )
+                    logger.info(
+                        "Connected to Qdrant",
+                        host=settings.QDRANT_HOST,
+                        port=settings.QDRANT_PORT,
+                    )
         return self._client
 
     # ----- Collection Management -----
@@ -156,15 +163,32 @@ class QdrantConnector:
         )
         return result.points
 
-    def scroll_all(self, collection_name: str, limit: int = 10000) -> list:
-        """Đọc tất cả points trong collection (phân trang)."""
-        points, _ = self.client.scroll(
-            collection_name=collection_name,
-            limit=limit,
-            with_payload=True,
-            with_vectors=False,
-        )
-        return points
+    def scroll_all(self, collection_name: str, batch_size: int = 1000,
+                   max_points: int | None = None) -> list:
+        """Đọc TẤT CẢ points trong collection (phân trang đúng cách).
+
+        Fix bug P1-9: bản cũ chỉ đọc trang đầu (limit=10000) → mọi point sau
+        #10000 biến mất khỏi BM25 index im lặng, không log, không lỗi.
+        """
+        all_points, offset = [], None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=collection_name,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            all_points.extend(points)
+            if offset is None:
+                break
+            if max_points is not None and len(all_points) >= max_points:
+                logger.warning("scroll_all hit max_points cap — dữ liệu bị cắt",
+                               collection=collection_name, cap=max_points,
+                               fetched=len(all_points))
+                break
+        logger.info("Scrolled collection", collection=collection_name, total=len(all_points))
+        return all_points
 
     def get_by_ids(self, collection_name: str, ids: list[str]) -> list:
         """Lấy points theo danh sách IDs (dùng retrieve tiêu chuẩn)."""

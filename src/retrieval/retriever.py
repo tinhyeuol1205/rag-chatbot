@@ -79,11 +79,13 @@ class RAGRetriever:
         """
         logger.info("RAG query started", query=user_query[:80])
 
-        # ① Multi-Query Expansion
-        expanded_queries = self.expander.expand(user_query)
-
-        # ② HyDE — sinh hypothetical answer embedding
-        hyde_vector = self.hyde.generate_embedding(user_query)
+        # ① + ② Song song hoá: expand và HyDE KHÔNG phụ thuộc nhau → tiết kiệm 1 LLM call
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_expand = pool.submit(self.expander.expand, user_query)
+            f_hyde = pool.submit(self.hyde.generate_embedding, user_query)
+            expanded_queries = f_expand.result()
+            hyde_vector = f_hyde.result()
 
         # ③ Hybrid Search — thu từng result_list RIÊNG BIỆT (không gộp chung)
         result_lists = [self.searcher.search(user_query, hyde_vector=hyde_vector)]

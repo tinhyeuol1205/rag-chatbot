@@ -10,9 +10,15 @@ Tách riêng khỏi retriever để:
 """
 
 from core import get_logger
+from core.errors import RAGChatbotError
 from retrieval.retriever import RAGRetriever
 
 logger = get_logger(__name__)
+
+USER_FACING_ERROR = (
+    "Xin lỗi, hệ thống đang gặp sự cố khi xử lý câu hỏi. "
+    "Vui lòng thử lại sau ít phút."
+)
 
 # Singleton retriever — load models 1 lần, dùng cho mọi request
 _retriever: RAGRetriever | None = None
@@ -29,7 +35,7 @@ def get_retriever() -> RAGRetriever:
 
 
 def chat(query: str) -> str:
-    """Xử lý câu hỏi và trả về câu trả lời (non-streaming).
+    """Xử lý câu hỏi và trả về câu trả lời (non-streaming). Không raise.
 
     Args:
         query: Câu hỏi của user
@@ -41,16 +47,24 @@ def chat(query: str) -> str:
         return "Please enter a question."
 
     try:
-        retriever = get_retriever()
-        answer = retriever.query(query, stream=False)
-        return answer
-    except Exception as e:
-        logger.error("Chat error", error=str(e))
-        return f"❌ Error: {str(e)}"
+        return get_retriever().query(query, stream=False)
+    except RAGChatbotError as e:
+        logger.exception("Chat failed (known error)")
+        return f"⚠️ {e}"          # lỗi mình tự raise → message đã an toàn, hữu ích
+    except Exception:
+        logger.exception("Chat failed (unexpected)")   # ★ full traceback vào log
+        return USER_FACING_ERROR                        # ★ không leak ra ngoài
+
+
+def chat_or_raise(query: str) -> str:
+    """Bản cho API layer — raise để FastAPI trả HTTP status đúng."""
+    if not query.strip():
+        return "Please enter a question."
+    return get_retriever().query(query, stream=False)
 
 
 def chat_stream(query: str):
-    """Xử lý câu hỏi và trả về câu trả lời (streaming — từng token).
+    """Xử lý câu hỏi và trả về câu trả lời (streaming — từng token). Không raise.
 
     Args:
         query: Câu hỏi của user
@@ -63,8 +77,10 @@ def chat_stream(query: str):
         return
 
     try:
-        retriever = get_retriever()
-        yield from retriever.query(query, stream=True)
-    except Exception as e:
-        logger.error("Chat stream error", error=str(e))
-        yield f"❌ Error: {str(e)}"
+        yield from get_retriever().query(query, stream=True)
+    except RAGChatbotError as e:
+        logger.exception("Chat stream failed (known error)")
+        yield f"⚠️ {e}"
+    except Exception:
+        logger.exception("Chat stream failed (unexpected)")
+        yield USER_FACING_ERROR
