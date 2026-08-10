@@ -20,6 +20,8 @@ Usage:
     # vectors.shape = (2, 384)
 """
 
+from functools import lru_cache
+
 from sentence_transformers import SentenceTransformer
 
 from core import get_logger
@@ -28,22 +30,31 @@ from core.config import settings
 logger = get_logger(__name__)
 
 
-class EmbeddingService:
-    """Singleton-like embedding service. Load model 1 lần, dùng mãi."""
+@lru_cache(maxsize=1)
+def _load_model() -> SentenceTransformer:
+    """Load 1 lần duy nhất cho cả process (lru_cache ở module level).
 
-    _model: SentenceTransformer | None = None
+    Fix bug P1-1: class attribute + self._model = ... tạo instance attribute
+    che class attribute → mỗi EmbeddingService() load lại model từ đầu.
+    """
+    logger.info("Loading embedding model", model=settings.EMBEDDING_MODEL_ID)
+    model = SentenceTransformer(
+        settings.EMBEDDING_MODEL_ID,
+        device=settings.EMBEDDING_DEVICE,
+    )
+    logger.info("Embedding model loaded", dimensions=settings.EMBEDDING_SIZE)
+    return model
+
+
+class EmbeddingService:
+    """Wrapper mỏng quanh model đã cache ở module level.
+
+    Tạo bao nhiêu instance cũng chỉ load model 1 lần (cache nằm ở _load_model).
+    """
 
     @property
     def model(self) -> SentenceTransformer:
-        """Lazy load model — chỉ download/load khi thực sự cần."""
-        if self._model is None:
-            logger.info("Loading embedding model", model=settings.EMBEDDING_MODEL_ID)
-            self._model = SentenceTransformer(
-                settings.EMBEDDING_MODEL_ID,
-                device=settings.EMBEDDING_DEVICE,
-            )
-            logger.info("Embedding model loaded", dimensions=settings.EMBEDDING_SIZE)
-        return self._model
+        return _load_model()
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed danh sách text → danh sách vectors.
@@ -54,7 +65,14 @@ class EmbeddingService:
         Returns:
             List of vectors, mỗi vector có EMBEDDING_SIZE dimensions (384)
         """
-        vectors = self.model.encode(texts, show_progress_bar=False)
+        if not texts:
+            return []
+        vectors = self.model.encode(
+            texts,
+            show_progress_bar=False,
+            normalize_embeddings=True,   # model BGE train/benchmark với vector đã normalize
+            batch_size=32,
+        )
         return vectors.tolist()
 
     def embed_single(self, text: str) -> list[float]:

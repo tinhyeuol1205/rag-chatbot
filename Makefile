@@ -36,8 +36,11 @@ ingest: ## Ingest tất cả sample documents vào Qdrant
 # --------- Run Application -----------
 # ======================================
 
-run-api: ## Chạy FastAPI backend (port 8000)
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+API_HOST ?= 127.0.0.1
+API_PORT ?= 8080          # ★ 8000 đang bị vLLM dùng — xem review PR 4 / P2-6
+
+run-api: ## Chạy FastAPI backend (mặc định 127.0.0.1:8080)
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m uvicorn api.main:app --host $(API_HOST) --port $(API_PORT) --reload
 
 run-ui: ## Chạy Gradio chat UI (port 7860)
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m api.ui

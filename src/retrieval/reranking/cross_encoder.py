@@ -29,6 +29,9 @@ Model: BAAI/bge-reranker-v2-m3 — top đầu MTEB reranking benchmark
 Tham khảo: rag_master.md — Module 5, mục 5.1
 """
 
+from functools import lru_cache
+from threading import Lock
+
 from sentence_transformers import CrossEncoder
 
 from core import get_logger
@@ -36,20 +39,29 @@ from core.config import settings
 
 logger = get_logger(__name__)
 
+# CrossEncoder không thread-safe khi predict song song → cần lock (liên quan P0-3)
+_predict_lock = Lock()
+
+
+@lru_cache(maxsize=1)
+def _load_reranker() -> CrossEncoder:
+    """Load 1 lần duy nhất cho cả process (lru_cache module-level)."""
+    logger.info("Loading reranker model", model=settings.RERANKER_MODEL_ID)
+    model = CrossEncoder(
+        settings.RERANKER_MODEL_ID,
+        device=settings.EMBEDDING_DEVICE,   # ★ config này đang bị bỏ qua hoàn toàn
+        max_length=512,                     # ★ chặn input dài → chậm bất định
+    )
+    logger.info("Reranker loaded")
+    return model
+
 
 class CrossEncoderReranker:
     """Rerank kết quả search bằng Cross-Encoder model."""
 
-    _model: CrossEncoder | None = None
-
     @property
     def model(self) -> CrossEncoder:
-        """Lazy load reranker model."""
-        if self._model is None:
-            logger.info("Loading reranker model", model=settings.RERANKER_MODEL_ID)
-            self._model = CrossEncoder(settings.RERANKER_MODEL_ID)
-            logger.info("Reranker loaded")
-        return self._model
+        return _load_reranker()             # ★ cache module-level, không reload
 
     def rerank(self, query: str, documents: list[dict]) -> list[dict]:
         """Rerank danh sách documents bằng Cross-Encoder.
@@ -64,15 +76,22 @@ class CrossEncoderReranker:
         if not documents:
             return []
 
-        # Tạo pairs: [(query, doc_content), (query, doc_content), ...]
-        pairs = [(query, doc["content"]) for doc in documents]
+        # ★ Cap số candidate — documents đã sort theo RRF nên cắt là an toàn
+        candidates = documents[:settings.RERANK_CANDIDATES]
+        if len(documents) > len(candidates):
+            logger.info("Capped rerank candidates",
+                        total=len(documents), kept=len(candidates))
 
-        # Cross-Encoder scoring — chấm điểm từng cặp
-        scores = self.model.predict(pairs)
+        # Tạo pairs: [(query, doc_content), (query, doc_content), ...]
+        pairs = [(query, doc["content"]) for doc in candidates]
+
+        # Cross-Encoder scoring — chấm điểm từng cặp (lock vì không thread-safe)
+        with _predict_lock:
+            scores = self.model.predict(pairs, batch_size=settings.RERANK_BATCH_SIZE)
 
         # ★ KHÔNG mutate list/dict của caller (bug P3-4):
         # copy sang dict mới rồi mới sort, input ban đầu giữ nguyên
-        scored = [{**doc, "rerank_score": float(s)} for doc, s in zip(documents, scores)]
+        scored = [{**doc, "rerank_score": float(s)} for doc, s in zip(candidates, scores)]
         scored.sort(key=lambda d: d["rerank_score"], reverse=True)
 
         # Giữ lại top KEEP_TOP_K
@@ -80,7 +99,7 @@ class CrossEncoderReranker:
 
         logger.info(
             "Reranking done",
-            input_count=len(documents),
+            input_count=len(candidates),
             output_count=len(top_docs),
             top_score=round(top_docs[0]["rerank_score"], 4) if top_docs else 0,
         )
