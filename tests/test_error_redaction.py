@@ -43,7 +43,7 @@ def test_api_error_body_contains_only_public_contract(monkeypatch):
             "connection refused: http://qdrant.internal:6333?token=secret"
         )
 
-    monkeypatch.setattr(api_main, "chat_or_raise", _raise)
+    monkeypatch.setattr(api_main, "chat_or_raise_with_sources", _raise)
     client = TestClient(api_main.app)
 
     response = client.post(
@@ -62,4 +62,3 @@ def test_api_error_body_contains_only_public_contract(monkeypatch):
     }
     assert "qdrant.internal" not in response.text
     assert "secret" not in response.text
-

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from core import get_logger
 from core.errors import RAGChatbotError
-from retrieval.retriever import RAGRetriever
+from retrieval.retriever import RAGResult, RAGRetriever
 
 logger = get_logger(__name__)
 
@@ -63,6 +63,13 @@ def chat_or_raise(query: str) -> str:
     return get_retriever().query(query, stream=False)
 
 
+def chat_or_raise_with_sources(query: str) -> RAGResult:
+    """API variant trả answer cùng sources đã thực sự đưa vào prompt."""
+    if not query.strip():
+        return RAGResult(answer="Please enter a question.")
+    return get_retriever().query_with_context(query)
+
+
 def chat_stream(query: str, history: list | None = None):
     """Xử lý câu hỏi và trả về câu trả lời (streaming — từng token). Không raise.
 
@@ -89,6 +96,42 @@ def chat_stream(query: str, history: list | None = None):
     except Exception:
         logger.exception("Chat stream failed (unexpected)")
         yield USER_FACING_ERROR
+
+
+def chat_stream_events(query: str, history: list | None = None):
+    """Stream token/source/error events cho API SSE và Gradio UI.
+
+    ``chat_stream`` được giữ để tương thích với callers chỉ cần token. Event API
+    mới giúp client phân biệt token, sources và lỗi thay vì trộn mọi thứ thành text.
+    """
+    if not query.strip():
+        yield {"event": "token", "data": "Please enter a question."}
+        yield {"event": "sources", "data": []}
+        return
+
+    try:
+        yield from get_retriever().stream_with_sources(
+            query,
+            history=_normalize_history(history or []),
+        )
+    except RAGChatbotError as exc:
+        logger.exception("Chat event stream failed (known error)", error_code=exc.error_code)
+        yield {
+            "event": "error",
+            "data": {
+                "code": exc.error_code,
+                "message": exc.public_message,
+            },
+        }
+    except Exception:
+        logger.exception("Chat event stream failed (unexpected)")
+        yield {
+            "event": "error",
+            "data": {
+                "code": "internal_error",
+                "message": USER_FACING_ERROR,
+            },
+        }
 
 
 def _normalize_history(chat_history: list) -> list[tuple[str, str]]:

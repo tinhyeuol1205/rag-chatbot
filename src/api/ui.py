@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import gradio as gr
 
-from api.chat import chat_stream
+from api.chat import chat_stream_events
 from core import get_logger
 
 logger = get_logger(__name__)
@@ -41,11 +41,43 @@ def respond(message: str, chat_history: list):
     Yields:
         Từng token để Gradio hiển thị streaming
     """
-    # Streaming: ghép từng token vào response
+    # Streaming: ghép token và render sources sau khi generation kết thúc.
     response = ""
-    for token in chat_stream(message, history=chat_history):
-        response += token
+    for event in chat_stream_events(message, history=chat_history):
+        if isinstance(event, str):
+            # Tương thích với caller/test cũ nếu event adapter bị thay thế.
+            response += event
+        elif event.get("event") == "token":
+            token = event.get("data", "")
+            response += str(token.get("text", "") if isinstance(token, dict) else token)
+        elif event.get("event") == "sources":
+            sources = event.get("data", [])
+            if isinstance(sources, dict):
+                sources = sources.get("sources", [])
+            response += _format_sources(sources)
+        elif event.get("event") == "error":
+            error = event.get("data", {})
+            if isinstance(error, dict):
+                message_text = error.get("message", "An unexpected error occurred.")
+            else:
+                message_text = str(error) if error else "An unexpected error occurred."
+            response += f"\n\n⚠️ {message_text}"
         yield response
+
+
+def _format_sources(sources: list[dict]) -> str:
+    """Render source metadata thành Markdown ở cuối câu trả lời."""
+    if not sources:
+        return ""
+    lines = ["\n\nSources:"]
+    for source in sources:
+        parts = [source.get("file_name") or "Unknown"]
+        if source.get("section_title"):
+            parts.append(source["section_title"])
+        if source.get("page_number") is not None:
+            parts.append(f"p.{source['page_number']}")
+        lines.append(f"- [{source.get('citation_id')}] {' → '.join(parts)}")
+    return "\n".join(lines)
 
 
 def create_ui() -> gr.ChatInterface:
@@ -74,4 +106,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

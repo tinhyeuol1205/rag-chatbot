@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import heapq
 import re
+import unicodedata
 from threading import Lock
 
 from rank_bm25 import BM25Okapi
@@ -42,12 +43,13 @@ _shared: dict = {"index": None, "documents": None, "version": 0}
 # Tokenizer giữ được mã kiểu 'TC-456' kể cả khi dính dấu câu:
 #   "see TC-456."    → ['tc-456']
 #   "(TC-456), done" → ['tc-456', 'done']
-_TOKEN_RE = re.compile(r"[0-9a-z]+(?:[-_][0-9a-z]+)*", re.UNICODE)
+_TOKEN_RE = re.compile(r"[^\W_]+(?:[-_][^\W_]+)*", re.UNICODE)
 
 
 def tokenize(text: str) -> list[str]:
-    """Tokenize text: lowercase + giữ mã hiệu dính dấu câu."""
-    return _TOKEN_RE.findall(text.lower())
+    """NFKC + casefold + tokenize Unicode, giữ mã nối bằng '-' hoặc '_'."""
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return _TOKEN_RE.findall(normalized)
 
 
 def invalidate_bm25_index() -> None:
