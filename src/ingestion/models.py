@@ -27,6 +27,7 @@ class DocumentMetadata(BaseModel):
     page_number: int | None = None
     section_title: str | None = None
     source_path: str = ""
+    dataset_id: str = ""
 
 
 class RawDocument(BaseModel):
@@ -62,15 +63,20 @@ class Chunk(BaseModel):
             self.chunk_id = self._generate_id()
 
     def _generate_id(self) -> str:
-        """UUIDv5 deterministic từ (file, vị trí, TOÀN BỘ content).
+        """UUIDv5 deterministic từ (dataset, file, vị trí, TOÀN BỘ content).
 
         - Dùng full content → không collision do prefix giống nhau (bug P2-5)
         - Kèm position → 2 đoạn text trùng nhau ở 2 vị trí vẫn là 2 chunk
         - Trả UUID chuẩn → Qdrant nhận trực tiếp, không cần normalize dấu '-'
+        - Dataset nằm trong key để hai namespace không collision
         - Deterministic: cùng input → cùng ID (idempotent khi re-ingest content không đổi)
         """
         digest = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
-        key = f"{self.metadata.source_path or self.metadata.file_name}|{self.position}|{digest}"
+        key = (
+            f"{self.metadata.dataset_id}|"
+            f"{self.metadata.source_path or self.metadata.file_name}|"
+            f"{self.position}|{digest}"
+        )
         return str(uuid.uuid5(_NAMESPACE, key))
 
 

@@ -27,6 +27,7 @@ from qdrant_client.models import (
     Filter,
     FilterSelector,
     MatchValue,
+    PointIdsList,
     PointStruct,
     VectorParams,
 )
@@ -105,8 +106,86 @@ class QdrantConnector:
         self.client.upsert(
             collection_name=collection_name,
             points=points,
+            wait=True,
         )
         logger.info("Upserted points", collection=collection_name, count=len(points))
+
+    def list_ids_by_source(
+        self,
+        collection_name: str,
+        *,
+        dataset_id: str,
+        file_name: str,
+        batch_size: int = 1000,
+    ) -> set[str]:
+        """Lấy toàn bộ point IDs của đúng dataset và relative file path."""
+        if not self._collection_exists(collection_name):
+            return set()
+
+        source_filter = Filter(must=[
+            FieldCondition(key="dataset_id", match=MatchValue(value=dataset_id)),
+            FieldCondition(key="file_name", match=MatchValue(value=file_name)),
+        ])
+        ids: set[str] = set()
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=collection_name,
+                scroll_filter=source_filter,
+                limit=batch_size,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            ids.update(str(point.id) for point in points)
+            if offset is None:
+                break
+        return ids
+
+    def list_file_names_by_dataset(
+        self,
+        collection_name: str,
+        *,
+        dataset_id: str,
+        batch_size: int = 1000,
+    ) -> set[str]:
+        """Lấy các relative file path đang lưu trong một dataset namespace."""
+        if not self._collection_exists(collection_name):
+            return set()
+
+        dataset_filter = Filter(must=[
+            FieldCondition(key="dataset_id", match=MatchValue(value=dataset_id)),
+        ])
+        file_names: set[str] = set()
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=collection_name,
+                scroll_filter=dataset_filter,
+                limit=batch_size,
+                offset=offset,
+                with_payload=["file_name"],
+                with_vectors=False,
+            )
+            file_names.update(
+                point.payload.get("file_name")
+                for point in points
+                if point.payload and point.payload.get("file_name")
+            )
+            if offset is None:
+                break
+        return file_names
+
+    def delete_by_ids(self, collection_name: str, ids: set[str]) -> None:
+        """Xóa chính xác một tập point IDs; mutation lỗi được propagate."""
+        if not ids or not self._collection_exists(collection_name):
+            return
+        self.client.delete(
+            collection_name=collection_name,
+            points_selector=PointIdsList(points=sorted(ids)),
+            wait=True,
+        )
+        logger.info("Deleted points by IDs", collection=collection_name, count=len(ids))
 
     def delete_by_file_name(self, collection_name: str, file_name: str) -> None:
         """Xoá mọi point của 1 file — gọi TRƯỚC khi ingest lại file đó.

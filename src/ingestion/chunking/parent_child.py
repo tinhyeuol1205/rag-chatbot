@@ -84,6 +84,7 @@ def parent_child_chunk(documents: list[RawDocument]) -> tuple[list[Chunk], list[
                     page_number=md.page_number,      # ★ GIỮ
                     section_title=title,             # ★ GIỮ
                     source_path=md.source_path,
+                    dataset_id=md.dataset_id,
                 ),
             )
             parent_chunks.append(parent)

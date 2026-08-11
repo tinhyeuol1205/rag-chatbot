@@ -96,6 +96,10 @@ class Settings(BaseSettings):
     CHILD_COLLECTION: str = "child_chunks"
     PARENT_COLLECTION: str = "parent_chunks"
 
+    # --- Ingestion namespace ---
+    # Dùng để sync đúng dataset, không đụng points của source directory khác.
+    INGEST_DATASET_ID: str = "sample_docs"
+
 
 # Singleton instance — import từ bất kỳ đâu đều dùng cùng 1 object
 settings = Settings()
