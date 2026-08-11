@@ -8,6 +8,10 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    env:
+      # Tests use fake clients and must not require repository/provider secrets.
+      LLM_PROVIDER: openai
+      OPENAI_API_KEY: test-only-key
     steps:
       - uses: actions/checkout@v4
 
