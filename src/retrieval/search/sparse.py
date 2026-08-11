@@ -21,11 +21,9 @@ Tham khảo: rag_master.md — Module 3, mục 3.1 (Sparse Embeddings)
 
 from __future__ import annotations
 
-import re
-
-from rank_bm25 import BM25Okapi
-
 import heapq
+import re
+import unicodedata
 from threading import Lock
 
 from rank_bm25 import BM25Okapi
@@ -45,12 +43,13 @@ _shared: dict = {"index": None, "documents": None, "version": 0}
 # Tokenizer giữ được mã kiểu 'TC-456' kể cả khi dính dấu câu:
 #   "see TC-456."    → ['tc-456']
 #   "(TC-456), done" → ['tc-456', 'done']
-_TOKEN_RE = re.compile(r"[0-9a-z]+(?:[-_][0-9a-z]+)*", re.UNICODE)
+_TOKEN_RE = re.compile(r"[^\W_]+(?:[-_][^\W_]+)*", re.UNICODE)
 
 
 def tokenize(text: str) -> list[str]:
-    """Tokenize text: lowercase + giữ mã hiệu dính dấu câu."""
-    return _TOKEN_RE.findall(text.lower())
+    """NFKC + casefold + tokenize Unicode, giữ mã nối bằng '-' hoặc '_'."""
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return _TOKEN_RE.findall(normalized)
 
 
 def invalidate_bm25_index() -> None:
@@ -144,11 +143,16 @@ class SparseSearcher:
         # Đọc tất cả child chunks từ Qdrant
         try:
             points = self.qdrant.scroll_all(settings.CHILD_COLLECTION)
-        except Exception as e:
+        except Exception as exc:
+            # Chi tiết SDK chỉ nằm trong traceback server-side; public layer
+            # dùng RetrievalError.public_message để tránh leak hạ tầng.
+            logger.exception(
+                "Failed to read child collection for BM25",
+                collection=settings.CHILD_COLLECTION,
+            )
             raise RetrievalError(
-                f"Không đọc được collection '{settings.CHILD_COLLECTION}'. "
-                f"Đã chạy 'make ingest' chưa? Lỗi gốc: {e}"
-            ) from e
+                f"Failed to read collection '{settings.CHILD_COLLECTION}' for BM25"
+            ) from exc
 
         documents, corpus = [], []  # corpus = tokenized documents cho BM25
 

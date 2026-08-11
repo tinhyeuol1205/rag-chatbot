@@ -25,6 +25,22 @@ def test_preserves_page_number():
     assert all(c.metadata.page_number == 12 for c in children)
 
 
+def test_preserves_dataset_id():
+    docs = [
+        RawDocument(
+            content="dataset content",
+            metadata=DocumentMetadata(
+                file_name="a.md",
+                file_type="md",
+                dataset_id="engineering",
+            ),
+        )
+    ]
+    parents, children = parent_child_chunk(docs)
+    assert all(p.metadata.dataset_id == "engineering" for p in parents)
+    assert all(c.metadata.dataset_id == "engineering" for c in children)
+
+
 def test_children_link_to_correct_parent():
     docs = [
         RawDocument(content="a" * 3000,

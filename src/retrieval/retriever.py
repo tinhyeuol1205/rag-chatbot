@@ -26,7 +26,7 @@ Luồng xử lý đầy đủ:
       │     → full_context chunks
       │
       ├─⑦ Context Assembly + Lost-in-Middle reorder
-      │     → context_text + sources_text
+      │     → AssembledContext (text + sources + kept documents)
       │
       └─⑧ LLM Generation (provider-agnostic)
             → Final answer + source citation
@@ -37,9 +37,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from core import get_logger
-from core.config import settings
 from core.llm import get_llm_service
-from retrieval.context.assembler import ContextAssembler
+from retrieval.context.assembler import AssembledContext, ContextAssembler, SourceRef
 from retrieval.context.parent_resolver import ParentResolver
 from retrieval.prompts import RAG_USER_PROMPT, SYSTEM_PROMPT
 from retrieval.query_transform.condense import QueryCondenser
@@ -62,9 +61,19 @@ class RAGResult:
 
     answer: str
     contexts: list[str] = field(default_factory=list)
-    sources: str = ""
+    sources: list[SourceRef] = field(default_factory=list)
     expanded_queries: list[str] = field(default_factory=list)
     num_candidates: int = 0
+
+
+@dataclass
+class RetrievalResult:
+    """Kết quả retrieval sau cùng một lần assemble/reorder/budget filtering."""
+
+    assembled: AssembledContext
+    expanded_queries: list[str] = field(default_factory=list)
+    search_query: str = ""
+    num_reranked_candidates: int = 0
 
 
 class RAGRetriever:
@@ -81,8 +90,8 @@ class RAGRetriever:
         self.condenser = QueryCondenser()
 
     def retrieve(self, user_query: str, history: list[tuple[str, str]] | None = None
-                 ) -> tuple[list[dict], str, str, list[str], str]:
-        """Chạy toàn bộ retrieval, trả về (resolved_docs, context, sources, expanded, search_query).
+                 ) -> RetrievalResult:
+        """Chạy retrieval và trả về context có cấu trúc.
 
         Tách riêng khỏi generate để evaluation lấy được context THẬT đã đưa vào LLM
         (bug P0-4: trước đây evaluate tự search riêng → contexts là child chunk,
@@ -124,9 +133,14 @@ class RAGRetriever:
         resolved = self.parent_resolver.resolve(top_chunks)
 
         # ⑦ Context Assembly
-        context_text, sources_text = self.assembler.assemble(resolved)
+        assembled = self.assembler.assemble(resolved)
 
-        return resolved, context_text, sources_text, expanded_queries, search_query
+        return RetrievalResult(
+            assembled=assembled,
+            expanded_queries=expanded_queries,
+            search_query=search_query,
+            num_reranked_candidates=len(top_chunks),
+        )
 
     def query(self, user_query: str, stream: bool = False,
               history: list[tuple[str, str]] | None = None):
@@ -140,7 +154,10 @@ class RAGRetriever:
         Returns:
             str hoặc generator — câu trả lời từ LLM
         """
-        _, context, sources, _, search_query = self.retrieve(user_query, history=history)
+        retrieval = self.retrieve(user_query, history=history)
+        context = retrieval.assembled.text
+        sources = retrieval.assembled.sources_text
+        search_query = retrieval.search_query
 
         # ⑧ LLM Generation — short-circuit nếu context rỗng (khỏi tốn LLM call vô ích)
         if not context.strip():
@@ -154,18 +171,60 @@ class RAGRetriever:
         else:
             return self._generate(search_query, context, sources)
 
-    def query_with_context(self, user_query: str) -> RAGResult:
+    def query_with_context(
+        self,
+        user_query: str,
+        history: list[tuple[str, str]] | None = None,
+    ) -> RAGResult:
         """Dùng cho evaluation — trả về ĐÚNG context đã đưa vào LLM (bug P0-4)."""
-        resolved, context, sources, expanded, search_query = self.retrieve(user_query)
-        answer = (self._generate(search_query, context, sources)
-                  if context.strip() else NO_CONTEXT_MSG)
+        retrieval = self.retrieve(user_query, history=history)
+        assembled = retrieval.assembled
+        answer = (
+            self._generate(
+                retrieval.search_query,
+                assembled.text,
+                assembled.sources_text,
+            )
+            if assembled.text.strip()
+            else NO_CONTEXT_MSG
+        )
         return RAGResult(
             answer=answer,
-            contexts=[d["content"] for d in resolved],   # ★ context THẬT (parent chunk)
-            sources=sources,
-            expanded_queries=expanded,
-            num_candidates=len(resolved),
+            contexts=[d["content"] for d in assembled.documents],
+            sources=assembled.sources,
+            expanded_queries=retrieval.expanded_queries,
+            num_candidates=len(assembled.documents),
         )
+
+    def stream_with_sources(
+        self,
+        user_query: str,
+        history: list[tuple[str, str]] | None = None,
+    ):
+        """Stream token events rồi sources sau khi generation hoàn tất.
+
+        Event data là Python object; API adapter chịu trách nhiệm serialize JSON cho
+        SSE, còn Gradio có thể dùng trực tiếp để render source list.
+        """
+        retrieval = self.retrieve(user_query, history=history)
+        assembled = retrieval.assembled
+
+        if not assembled.text.strip():
+            yield {"event": "token", "data": NO_CONTEXT_MSG}
+        else:
+            yield from (
+                {"event": "token", "data": token}
+                for token in self._generate_stream(
+                    retrieval.search_query,
+                    assembled.text,
+                    assembled.sources_text,
+                )
+            )
+
+        yield {
+            "event": "sources",
+            "data": [source.as_dict() for source in assembled.sources],
+        }
 
     def _generate(self, query: str, context: str, sources: str) -> str:
         """Gọi LLM sinh câu trả lời (non-streaming)."""
@@ -191,4 +250,3 @@ class RAGRetriever:
             system_prompt=SYSTEM_PROMPT,
             temperature=0.1,
         )
-

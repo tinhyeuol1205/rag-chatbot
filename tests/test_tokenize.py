@@ -16,3 +16,17 @@ def test_empty_and_punctuation_only():
 def test_handles_normal_text():
     assert "laptop" in tokenize("What is the laptop policy?")
     assert tokenize("Annual Leave") == ["annual", "leave"]
+
+
+def test_preserves_vietnamese_words():
+    assert tokenize("Chính sách nghỉ phép") == ["chính", "sách", "nghỉ", "phép"]
+
+
+def test_preserves_unicode_and_product_codes_together():
+    assert tokenize("Quy định TC-456 áp dụng.") == [
+        "quy", "định", "tc-456", "áp", "dụng"
+    ]
+
+
+def test_nfkc_normalization():
+    assert tokenize("ＡＢＣ-１２３") == ["abc-123"]

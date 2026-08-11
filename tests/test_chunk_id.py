@@ -33,3 +33,11 @@ def test_chunk_id_deterministic():
     a = Chunk(content="same", position="0:0", metadata=_md())
     b = Chunk(content="same", position="0:0", metadata=_md())
     assert a.chunk_id == b.chunk_id
+
+
+def test_dataset_id_is_part_of_chunk_identity():
+    same = DocumentMetadata(file_name="a.md", file_type="md", source_path="a.md", dataset_id="docs-a")
+    other = same.model_copy(update={"dataset_id": "docs-b"})
+    assert Chunk(content="same", position="0:0", metadata=same).chunk_id != Chunk(
+        content="same", position="0:0", metadata=other
+    ).chunk_id

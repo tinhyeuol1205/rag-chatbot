@@ -23,54 +23,114 @@ Tham khảo: rag_master.md — Module 5, mục 5.2
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from core import get_logger
 from core.config import settings
 
 logger = get_logger(__name__)
 
 
+@dataclass(frozen=True)
+class SourceRef:
+    """Một nguồn duy nhất được gắn citation ID ổn định trong context."""
+
+    citation_id: int
+    file_name: str
+    section_title: str | None = None
+    page_number: int | None = None
+
+    @property
+    def label(self) -> str:
+        """Định dạng nguồn: ``file → section → p.N``."""
+        parts = [self.file_name or "Unknown"]
+        if self.section_title:
+            parts.append(self.section_title)
+        if self.page_number is not None:
+            parts.append(f"p.{self.page_number}")
+        return " → ".join(parts)
+
+    def as_dict(self) -> dict:
+        """Chuyển sang payload JSON-safe cho API/SSE/UI."""
+        return {
+            "citation_id": self.citation_id,
+            "file_name": self.file_name,
+            "section_title": self.section_title,
+            "page_number": self.page_number,
+        }
+
+
+@dataclass
+class AssembledContext:
+    """Context, sources và documents sau cùng một lần reorder/budget filtering."""
+
+    text: str = ""
+    sources: list[SourceRef] = field(default_factory=list)
+    documents: list[dict] = field(default_factory=list)
+
+    @property
+    def sources_text(self) -> str:
+        """Danh sách sources dùng trong prompt LLM."""
+        return "\n".join(
+            f"[{source.citation_id}] {source.label}" for source in self.sources
+        )
+
+
 class ContextAssembler:
     """Tổng hợp context với source citation + Lost-in-Middle reorder."""
 
-    def assemble(self, documents: list[dict]) -> tuple[str, str]:
-        """Tổng hợp documents thành context string cho LLM.
-
-        Cả context block (có [Source N]) và sources summary ([N] ...) được build
-        từ CÙNG list đã reorder → số [N] trong context khớp chính xác với số [N]
-        trong danh sách Sources (bug P2-1: trước đây 2 list khác nhau).
+    def assemble(self, documents: list[dict]) -> AssembledContext:
+        """Tổng hợp context + sources từ cùng list sau reorder và budget filtering.
 
         Args:
             documents: Danh sách documents (đã resolve parent)
 
         Returns:
-            (context_text, sources_text) — 2 strings để đưa vào prompt
+            ``AssembledContext`` chứa text, sources và documents thực sự được giữ.
         """
         if not documents:
-            return "", ""
+            return AssembledContext()
 
         # Bước 1: Lost-in-Middle reorder
         reordered = self._lost_in_middle_reorder(documents)
 
-        # Bước 2: Ghép context + sources từ CÙNG list reordered, kèm token budget
-        context_parts, sources, seen = [], [], set()
+        # Bước 2: citation ID thuộc về unique source, không thuộc vị trí block.
+        source_ids: dict[tuple[str, str, int | None], int] = {}
+        sources: list[SourceRef] = []
+        kept_documents: list[dict] = []
+        context_parts: list[str] = []
         used_chars, dropped = 0, 0
 
-        for i, doc in enumerate(reordered, 1):
-            label = f"[Source {i}: {self._format_source(doc)}]"
-            block = f"{label}\n{doc['content']}"
+        for doc in reordered:
+            key = self._source_key(doc)
+            citation_id = source_ids.get(key)
+            if citation_id is None:
+                citation_id = len(source_ids) + 1
 
-            # ★ P2-10: token budget — bỏ cả block, KHÔNG cắt giữa câu
-            if used_chars + len(block) > settings.MAX_CONTEXT_CHARS and context_parts:
+            source = SourceRef(
+                citation_id=citation_id,
+                file_name=doc.get("file_name") or "Unknown",
+                section_title=doc.get("section_title") or None,
+                page_number=doc.get("page_number"),
+            )
+            label = f"[Source {source.citation_id}: {source.label}]"
+            block = f"{label}\n{doc['content']}"
+            separator_size = len("\n\n---\n\n") if context_parts else 0
+
+            # Hard limit: bỏ cả block, kể cả block đầu tiên nếu tự nó quá lớn.
+            if used_chars + separator_size + len(block) > settings.MAX_CONTEXT_CHARS:
                 dropped += 1
                 continue
 
-            context_parts.append(block)
-            used_chars += len(block)
+            # Chỉ commit source sau khi block thực sự được giữ; source bị drop
+            # không được xuất hiện trong prompt/API.
+            if key not in source_ids:
+                source_ids[key] = citation_id
+                sources.append(source)
 
-            key = self._source_key(doc)
-            if key not in seen:
-                seen.add(key)
-                sources.append(f"[{i}] {self._format_source(doc)}")   # ★ CÙNG số i
+            kept_documents.append({**doc, "citation_id": citation_id})
+            context_parts.append(block)
+            used_chars += separator_size + len(block)
 
         if dropped:
             logger.warning(
@@ -82,27 +142,20 @@ class ContextAssembler:
             )
 
         context_text = "\n\n---\n\n".join(context_parts)
-        sources_text = "\n".join(sources)
-
-        logger.info("Context assembled", chunks=len(context_parts), total_chars=len(context_text))
-        return context_text, sources_text
-
-    @staticmethod
-    def _format_source(doc: dict) -> str:
-        """Định dạng nguồn: 'file_name → section_title → p.N'."""
-        parts = [doc.get("file_name") or "Unknown"]
-        if doc.get("section_title"):
-            parts.append(doc["section_title"])
-        if doc.get("page_number") is not None:
-            parts.append(f"p.{doc['page_number']}")
-        return " → ".join(parts)
+        logger.info("Context assembled", chunks=len(kept_documents), total_chars=len(context_text))
+        return AssembledContext(
+            text=context_text,
+            sources=sources,
+            documents=kept_documents,
+        )
 
     @staticmethod
-    def _source_key(doc: dict) -> str:
-        """Key để dedupe nguồn trùng lặp (cùng file + section + page)."""
+    def _source_key(doc: dict) -> tuple[str, str, int | None]:
+        """Key tuple để dedupe cùng file + section + page, không collision dấu ':'."""
         return (
-            f"{doc.get('file_name', '')}:{doc.get('section_title', '')}"
-            f":{doc.get('page_number')}"
+            doc.get("file_name") or "",
+            doc.get("section_title") or "",
+            doc.get("page_number"),
         )
 
     def _lost_in_middle_reorder(self, documents: list[dict]) -> list[dict]:
