@@ -48,9 +48,9 @@ def chat(query: str) -> str:
 
     try:
         return get_retriever().query(query, stream=False)
-    except RAGChatbotError as e:
-        logger.exception("Chat failed (known error)")
-        return f"⚠️ {e}"          # lỗi mình tự raise → message đã an toàn, hữu ích
+    except RAGChatbotError as exc:
+        logger.exception("Chat failed (known error)", error_code=exc.error_code)
+        return f"⚠️ {exc.public_message}"
     except Exception:
         logger.exception("Chat failed (unexpected)")   # ★ full traceback vào log
         return USER_FACING_ERROR                        # ★ không leak ra ngoài
@@ -81,9 +81,11 @@ def chat_stream(query: str, history: list | None = None):
         yield from get_retriever().query(
             query, stream=True, history=_normalize_history(history or [])
         )
-    except RAGChatbotError as e:
-        logger.exception("Chat stream failed (known error)")
-        yield f"⚠️ {e}"
+    except RAGChatbotError as exc:
+        logger.exception("Chat stream failed (known error)", error_code=exc.error_code)
+        # PR 7 sẽ chuẩn hóa event error riêng cho SSE. Ở PR 6 tối thiểu không
+        # để message nội bộ của exception đi vào stream như token trả lời.
+        yield f"⚠️ {exc.public_message}"
     except Exception:
         logger.exception("Chat stream failed (unexpected)")
         yield USER_FACING_ERROR

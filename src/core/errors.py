@@ -12,26 +12,46 @@ Usage:
 """
 
 from __future__ import annotations
+
+
 class RAGChatbotError(Exception):
-    """Base exception — tất cả lỗi trong project kế thừa từ đây."""
-    pass
+    """Base exception với message nội bộ và contract an toàn cho client.
+
+    ``str(exc)`` được giữ cho log/debug nội bộ. API/UI phải dùng
+    ``error_code`` và ``public_message`` để không vô tình trả exception của SDK,
+    URL nội bộ hoặc chi tiết hạ tầng ra ngoài.
+    """
+
+    error_code = "rag_error"
+    public_message = (
+        "Xin lỗi, hệ thống đang gặp sự cố khi xử lý câu hỏi. "
+        "Vui lòng thử lại sau ít phút."
+    )
 
 
 class ConfigurationError(RAGChatbotError):
     """Thiếu hoặc sai config (API key, DB connection, ...)."""
-    pass
+
+    error_code = "configuration_error"
+    public_message = "Hệ thống chưa được cấu hình đúng. Vui lòng liên hệ quản trị viên."
 
 
 class ParsingError(RAGChatbotError):
     """Lỗi khi parse document (file hỏng, format không hỗ trợ, ...)."""
-    pass
+
+    error_code = "parsing_error"
+    public_message = "Không thể đọc một tài liệu trong kho dữ liệu."
 
 
 class IngestionError(RAGChatbotError):
     """Lỗi trong ingestion pipeline (chunking, embedding, store, ...)."""
-    pass
+
+    error_code = "ingestion_error"
+    public_message = "Không thể cập nhật kho tài liệu. Vui lòng thử lại sau."
 
 
 class RetrievalError(RAGChatbotError):
     """Lỗi trong retrieval pipeline (search, rerank, ...)."""
-    pass
+
+    error_code = "retrieval_unavailable"
+    public_message = "Kho tài liệu tạm thời không khả dụng. Vui lòng thử lại sau."

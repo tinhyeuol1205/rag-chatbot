@@ -116,3 +116,12 @@ Những điểm nên **giữ nguyên**, đừng "sửa" trong lúc refactor:
    không cần `.env` đầy đủ.
 7. **Eval dataset viết tay từ chính sample docs** (`dataset.py`) với ground truth chi
    tiết, cụ thể, kiểm chứng được. Nhiều project bỏ hẳn bước này.
+
+---
+
+## Review vòng 2 — sau khi triển khai 5 PR
+
+Code tại commit `939c1d1` đã được review lại sau báo cáo
+[`IMPLEMENTATION-SUMMARY.md`](IMPLEMENTATION-SUMMARY.md). Các regression và phần fix
+chưa khép kín được chia thành PR 6-9 tại
+[`ROUND2-README.md`](ROUND2-README.md).

@@ -53,3 +53,8 @@ qdrant_storage/
 .coverage
 htmlcov/
 .pytest_cache/
+
+# ============================================
+# Review (chứa các file review, không cần push)
+# ============================================
+review/

@@ -12,6 +12,8 @@ Hoặc:      uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
 from __future__ import annotations
 
+from secrets import compare_digest
+
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -36,8 +38,12 @@ def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
     """Auth tối thiểu — bỏ qua nếu API_KEY rỗng (dev mode)."""
     if not settings.API_KEY:          # dev mode: bỏ qua
         return
-    if x_api_key != settings.API_KEY:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid API key")
+    if x_api_key is None or not compare_digest(x_api_key, settings.API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "invalid_api_key", "message": "Invalid API key"},
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
 
 # CORS — cho phép Gradio UI gọi API (chỉ origin cụ thể, không "*")
 app.add_middleware(
@@ -76,14 +82,18 @@ def chat_endpoint(request: ChatRequest):
     """
     try:
         return ChatResponse(answer=chat_or_raise(request.query))
-    except RAGChatbotError as e:
-        raise HTTPException(status_code=503, detail=str(e)) from e
+    except RAGChatbotError as exc:
+        logger.exception("Known error in /chat", error_code=exc.error_code)
+        raise HTTPException(
+            status_code=503,
+            detail={"code": exc.error_code, "message": exc.public_message},
+        ) from exc
     except Exception:
         logger.exception("Unhandled error in /chat")
         raise HTTPException(status_code=500, detail=USER_FACING_ERROR)
 
 
-@app.post("/chat/stream")
+@app.post("/chat/stream", dependencies=[Depends(require_api_key)])
 async def chat_stream_endpoint(request: ChatRequest):
     """Chat streaming endpoint — trả về SSE (Server-Sent Events).
 

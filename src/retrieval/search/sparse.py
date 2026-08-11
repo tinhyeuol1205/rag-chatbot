@@ -21,11 +21,8 @@ Tham khảo: rag_master.md — Module 3, mục 3.1 (Sparse Embeddings)
 
 from __future__ import annotations
 
-import re
-
-from rank_bm25 import BM25Okapi
-
 import heapq
+import re
 from threading import Lock
 
 from rank_bm25 import BM25Okapi
@@ -144,11 +141,16 @@ class SparseSearcher:
         # Đọc tất cả child chunks từ Qdrant
         try:
             points = self.qdrant.scroll_all(settings.CHILD_COLLECTION)
-        except Exception as e:
+        except Exception as exc:
+            # Chi tiết SDK chỉ nằm trong traceback server-side; public layer
+            # dùng RetrievalError.public_message để tránh leak hạ tầng.
+            logger.exception(
+                "Failed to read child collection for BM25",
+                collection=settings.CHILD_COLLECTION,
+            )
             raise RetrievalError(
-                f"Không đọc được collection '{settings.CHILD_COLLECTION}'. "
-                f"Đã chạy 'make ingest' chưa? Lỗi gốc: {e}"
-            ) from e
+                f"Failed to read collection '{settings.CHILD_COLLECTION}' for BM25"
+            ) from exc
 
         documents, corpus = [], []  # corpus = tokenized documents cho BM25
 
