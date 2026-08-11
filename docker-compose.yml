@@ -1,6 +1,8 @@
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    # Pin version đã smoke-test với qdrant-client 1.19.0 (P3-9 — tránh `latest`
+    # thay đổi ngầm giữa local/runtime, mất reproducibility).
+    image: qdrant/qdrant:v1.18.3
     container_name: rag-chatbot-qdrant
     ports:
       - "6333:6333"   # HTTP API

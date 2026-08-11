@@ -41,11 +41,11 @@ class ParentResolver:
             return []
 
         # Thu thập parent_ids (bỏ None, deduplicate)
-        parent_ids = list(set(
+        parent_ids = list({
             doc["parent_id"]
             for doc in child_results
             if doc.get("parent_id")
-        ))
+        })
 
         if not parent_ids:
             # Không có parent_id → trả về child chunks nguyên bản

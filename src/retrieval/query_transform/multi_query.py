@@ -70,7 +70,7 @@ class MultiQueryExpander:
                 temperature=0.7,  # Creativity cao để tạo biến thể đa dạng
                 max_tokens=300,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - optional LLM enhancement must degrade
             # ★ Degrade: không có variant vẫn search được bằng query gốc
             logger.warning("Multi-query expansion failed, using original query only",
                            error=str(e))

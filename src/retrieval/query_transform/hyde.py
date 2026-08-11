@@ -58,7 +58,7 @@ class HyDEGenerator:
         # Bước 1: LLM sinh câu trả lời giả
         try:
             hypothetical_answer = self._generate_hypothetical(query)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - optional LLM enhancement must degrade
             logger.warning("HyDE generation failed, skipping HyDE", error=str(e))
             return None
         if not hypothetical_answer.strip():

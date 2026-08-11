@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from threading import Lock
 
 from core import get_logger
 from core.config import settings
@@ -42,7 +43,6 @@ class BaseLLMService(ABC):
         max_tokens: int = 1024,
     ) -> str:
         """Gọi LLM và trả về response text."""
-        pass
 
     @abstractmethod
     def generate_stream(
@@ -53,7 +53,6 @@ class BaseLLMService(ABC):
         max_tokens: int = 1024,
     ):
         """Gọi LLM và trả về generator (streaming)."""
-        pass
 
 
 class OpenAILLMService(BaseLLMService):
@@ -198,9 +197,12 @@ class GeminiLLMService(BaseLLMService):
 
         stream = self._client.interactions.create(**kwargs)
         for event in stream:
-            if event.event_type == "step.delta":
-                if event.delta.type == "text" and event.delta.text:
-                    yield event.delta.text
+            if (
+                event.event_type == "step.delta"
+                and event.delta.type == "text"
+                and event.delta.text
+            ):
+                yield event.delta.text
 
 
 # ================================================================
@@ -208,29 +210,35 @@ class GeminiLLMService(BaseLLMService):
 # ================================================================
 
 _llm_instance: BaseLLMService | None = None
+_llm_lock = Lock()
 
 
 def get_llm_service() -> BaseLLMService:
     """Singleton factory — tạo LLM service dựa trên LLM_PROVIDER config.
+
+    Thread-safe (lock + double-check): cold-start đồng thời chỉ tạo 1 client
+    (bug P2-14), tránh mở nhiều connection/API client giống nhau.
 
     Returns:
         OpenAILLMService nếu LLM_PROVIDER="openai"
         GeminiLLMService nếu LLM_PROVIDER="gemini"
     """
     global _llm_instance
-    if _llm_instance is None:
-        provider = settings.LLM_PROVIDER.lower()
+    if _llm_instance is None:               # fast path — không cần lock
+        with _llm_lock:                     # slow path — lấy lock
+            if _llm_instance is None:       # double-check LẠI sau khi có lock
+                provider = settings.LLM_PROVIDER.lower()
 
-        if provider == "gemini":
-            _llm_instance = GeminiLLMService()
-        elif provider == "openai":
-            _llm_instance = OpenAILLMService()
-        else:
-            raise ConfigurationError(
-                f"LLM_PROVIDER='{settings.LLM_PROVIDER}' không hợp lệ. "
-                f"Dùng 'openai' hoặc 'gemini'."
-            )
+                if provider == "gemini":
+                    _llm_instance = GeminiLLMService()
+                elif provider == "openai":
+                    _llm_instance = OpenAILLMService()
+                else:
+                    raise ConfigurationError(
+                        f"LLM_PROVIDER='{settings.LLM_PROVIDER}' không hợp lệ. "
+                        f"Dùng 'openai' hoặc 'gemini'."
+                    )
 
-        logger.info("LLM Service created", provider=provider)
+                logger.info("LLM Service created", provider=provider)
 
     return _llm_instance

@@ -18,7 +18,7 @@ from pathlib import Path
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from core.errors import ConfigurationError     # ★ dùng exception đang bị bỏ không
+from core.errors import ConfigurationError  # ★ dùng exception đang bị bỏ không
 
 # Tìm thư mục gốc dự án (chứa .env file)
 # __file__ = src/core/config.py → parent.parent.parent = rag-chatbot/

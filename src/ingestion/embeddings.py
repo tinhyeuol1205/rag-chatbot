@@ -20,7 +20,7 @@ Usage:
 
 from __future__ import annotations
 
-from functools import lru_cache
+from threading import Lock
 
 from sentence_transformers import SentenceTransformer
 
@@ -29,21 +29,27 @@ from core.config import settings
 
 logger = get_logger(__name__)
 
+# Explicit global + lock thay vì lru_cache: dễ chứng minh single-flight hơn
+# (bug P2-14 — lru_cache cho phép wrapped function chạy lại nếu 2 thread cùng
+# miss cache; sentence-transformer load trùng model → RAM tăng gấp đôi/OOM).
+_embedding_model: SentenceTransformer | None = None
+_embedding_model_lock = Lock()
 
-@lru_cache(maxsize=1)
+
 def _load_model() -> SentenceTransformer:
-    """Load 1 lần duy nhất cho cả process (lru_cache ở module level).
-
-    Fix bug P1-1: class attribute + self._model = ... tạo instance attribute
-    che class attribute → mỗi EmbeddingService() load lại model từ đầu.
-    """
-    logger.info("Loading embedding model", model=settings.EMBEDDING_MODEL_ID)
-    model = SentenceTransformer(
-        settings.EMBEDDING_MODEL_ID,
-        device=settings.EMBEDDING_DEVICE,
-    )
-    logger.info("Embedding model loaded", dimensions=settings.EMBEDDING_SIZE)
-    return model
+    """Load 1 lần duy nhất cho cả process. Thread-safe (lock + double-check)."""
+    global _embedding_model
+    if _embedding_model is None:            # fast path — không cần lock
+        with _embedding_model_lock:         # slow path — lấy lock
+            if _embedding_model is None:    # double-check LẠI sau khi có lock
+                logger.info("Loading embedding model", model=settings.EMBEDDING_MODEL_ID)
+                model = SentenceTransformer(
+                    settings.EMBEDDING_MODEL_ID,
+                    device=settings.EMBEDDING_DEVICE,
+                )
+                _embedding_model = model    # publish chỉ sau load thành công
+                logger.info("Embedding model loaded", dimensions=settings.EMBEDDING_SIZE)
+    return _embedding_model
 
 
 class EmbeddingService:

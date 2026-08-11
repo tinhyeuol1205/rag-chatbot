@@ -23,4 +23,3 @@ class BaseParser(ABC):
         Mỗi RawDocument thường = 1 trang (PDF) hoặc 1 section (Markdown).
         Trả về list vì 1 file có thể có nhiều trang/sections.
         """
-        pass

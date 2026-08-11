@@ -8,6 +8,7 @@ System prompt hướng dẫn LLM:
 """
 
 from __future__ import annotations
+
 SYSTEM_PROMPT = """You are an internal company assistant. Your role is to answer questions
 based ONLY on the provided context from company documents.
 

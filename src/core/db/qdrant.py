@@ -31,6 +31,7 @@ from qdrant_client.models import (
     PointStruct,
     VectorParams,
 )
+from typing_extensions import Self
 
 from core.config import settings
 from core.logger import get_logger
@@ -41,11 +42,11 @@ logger = get_logger(__name__)
 class QdrantConnector:
     """Singleton connector cho Qdrant vector database (thread-safe)."""
 
-    _instance: "QdrantConnector | None" = None
+    _instance: QdrantConnector | None = None
     _client: QdrantClient | None = None
     _lock = Lock()
 
-    def __new__(cls) -> "QdrantConnector":
+    def __new__(cls) -> Self:
         """Singleton thread-safe: chỉ tạo instance mới nếu chưa tồn tại."""
         with cls._lock:
             if cls._instance is None:
@@ -210,6 +211,7 @@ class QdrantConnector:
 
     def create_payload_index(self, collection_name: str, field_name: str) -> None:
         """Index cho payload field — bắt buộc để filter/delete-by-filter chạy nhanh."""
+        from qdrant_client.http.exceptions import UnexpectedResponse
         from qdrant_client.models import PayloadSchemaType
         try:
             self.client.create_payload_index(
@@ -218,8 +220,17 @@ class QdrantConnector:
                 field_schema=PayloadSchemaType.KEYWORD,
             )
             logger.info("Created payload index", collection=collection_name, field=field_name)
-        except Exception as e:      # index đã tồn tại → bỏ qua
-            logger.debug("Payload index skipped", field=field_name, error=str(e))
+        except UnexpectedResponse as exc:
+            if exc.status_code == 409:      # index đã tồn tại → bỏ qua (idempotent)
+                logger.debug("Payload index skipped (already exists)",
+                             field=field_name)
+            else:
+                # Network/auth hoặc lỗi Qdrant khác phải propagate — không được
+                # coi mọi exception là "đã tồn tại" (P3-8).
+                logger.error("Failed to create payload index",
+                             collection=collection_name, field=field_name,
+                             status=exc.status_code)
+                raise
 
     # ----- Read Operations -----
 

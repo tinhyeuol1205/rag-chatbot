@@ -4,7 +4,7 @@ UV := $(shell command -v uv 2>/dev/null || echo /Users/binh.dv/.local/bin/uv)
 # Bắt uv sync đồng bộ vào đúng môi trường rag/ (thay vì tạo .venv mặc định)
 export UV_PROJECT_ENVIRONMENT := rag
 
-.PHONY: help install install-dev local-start local-stop ingest ingest-sync run-api run-ui evaluate test clean
+.PHONY: help install install-dev local-start local-stop ingest ingest-sync run-api run-ui evaluate test lint check clean
 
 help: ## Hiển thị danh sách lệnh
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -13,11 +13,11 @@ help: ## Hiển thị danh sách lệnh
 # ------- Setup & Infrastructure -------
 # ======================================
 
-install: ## Cài đặt dependencies (uv sync — đọc pyproject.toml + uv.lock, đồng bộ vào rag/)
-	$(UV) sync
+install: ## Cài đặt dependencies (uv sync --locked — đọc pyproject.toml + uv.lock, đồng bộ vào rag/)
+	$(UV) sync --locked
 
-install-dev: ## Cài đặt dependencies + dev deps (pytest, ruff)
-	$(UV) sync --extra dev
+install-dev: ## Cài đặt dependencies + dev deps (uv sync --locked — đọc pyproject.toml + uv.lock, đồng bộ vào rag/)
+	$(UV) sync --locked --extra dev
 
 local-start: ## Khởi động Qdrant (Docker)
 	docker compose up -d
@@ -61,6 +61,11 @@ evaluate: ## Chạy RAG evaluation (RAGAS metrics)
 
 test: ## Chạy unit tests
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m pytest tests/ -v
+
+lint: ## Static checks (ruff)
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m ruff check src tests
+
+check: lint test ## Chạy toàn bộ quality gate local
 
 # ======================================
 # ------------- Cleanup ----------------

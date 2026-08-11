@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import gradio as gr
 
-from api.chat import chat_stream_events
+from api.chat import chat_stream_events, get_retriever
 from core import get_logger
 
 logger = get_logger(__name__)
@@ -96,6 +96,9 @@ def create_ui() -> gr.ChatInterface:
 
 def main():
     logger.info("Starting Gradio UI")
+    # Fail-fast: config/model errors hiện ở đây, không phải request đầu tiên
+    # (bug P2-14 — warmup load embedding/reranker model 1 lần).
+    get_retriever().warmup()
     demo = create_ui()
     demo.launch(
         server_name="localhost",

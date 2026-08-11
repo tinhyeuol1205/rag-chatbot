@@ -142,6 +142,17 @@ class RAGRetriever:
             num_reranked_candidates=len(top_chunks),
         )
 
+    def warmup(self) -> None:
+        """Load các model nặng TRƯỚC khi nhận request (fail-fast, bug P2-14).
+
+        Chỉ chạm embedding + reranker model (load về RAM 1 lần); KHÔNG gọi LLM
+        API (không tốn tiền) và không chạy inference/query. Sample-free: truy cập
+        property ``model`` là loader load model về RAM ngay (không embed thử).
+        """
+        _ = self.searcher.dense.embedder.model
+        _ = self.reranker.model
+        logger.info("RAG retriever warmed up")
+
     def query(self, user_query: str, stream: bool = False,
               history: list[tuple[str, str]] | None = None):
         """Xử lý câu hỏi qua toàn bộ RAG pipeline.
