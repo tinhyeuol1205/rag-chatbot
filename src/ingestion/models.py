@@ -57,7 +57,7 @@ class Chunk(BaseModel):
     position: str = ""
     metadata: DocumentMetadata
 
-    def model_post_init(self, __context) -> None:
+    def model_post_init(self, context, /) -> None:
         """Tự động tạo chunk_id sau khi init nếu chưa có."""
         if not self.chunk_id:
             self.chunk_id = self._generate_id()

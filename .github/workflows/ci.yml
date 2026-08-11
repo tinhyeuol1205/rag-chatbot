@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    env:
+      # Tests use fake clients and must not require repository/provider secrets.
+      LLM_PROVIDER: openai
+      OPENAI_API_KEY: test-only-key
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Sync locked dependencies (dev)
+        run: uv sync --locked --extra dev
+
+      - name: Ruff check
+        run: uv run ruff check src tests
+
+      - name: Pytest
+        run: PYTHONPATH=src uv run pytest tests -q
+
+  lock-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Verify uv.lock is fresh
+        run: uv lock --check

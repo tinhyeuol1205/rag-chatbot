@@ -53,10 +53,10 @@ User Query                               │
 
 ## 🚀 Quick Start
 
-> ⚠️ Yêu cầu **Python ≥3.10** (môi trường `rag/` dùng 3.12).
+> ⚠️ Yêu cầu **Python ≥3.10, <3.13** (constraint trong `pyproject.toml`; môi trường `rag/` dùng 3.12).
 
 ```bash
-# 1. Clone & install (uv sync đọc pyproject.toml + uv.lock → tạo môi trường rag/)
+# 1. Clone & install (uv sync --locked đọc pyproject.toml + uv.lock → tạo môi trường rag/)
 git clone <repo-url>
 cd rag-chatbot
 cp .env.example .env          # Chọn LLM_PROVIDER + điền API key
@@ -110,6 +110,60 @@ Metrics:
 - **Faithfulness** — Is the answer grounded in the context?
 - **Answer Relevance** — Does the answer address the question?
 
+## 🔌 API
+
+Backend chạy ở `http://127.0.0.1:8080` (`make run-api`). Tài liệu OpenAPI tại
+`/docs`.
+
+### Auth
+
+- Nếu `API_KEY` rỗng (mặc định, dev mode) → không cần auth.
+- Nếu `API_KEY` được set → `/chat` và `/chat/stream` phải kèm header
+  `X-API-Key: <API_KEY>`; `/health` vẫn public cho health check.
+- ⚠️ Không expose server ra ngoài khi `API_KEY` rỗng — chỉ chạy localhost.
+
+```bash
+curl -X POST http://127.0.0.1:8080/chat \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-key" \
+  -d '{"query": "What is the password policy?"}'
+```
+
+### Response schema
+
+`POST /chat` trả JSON:
+
+```json
+{
+  "answer": "All passwords must be at least 12 characters... [1]",
+  "sources": [
+    {"citation_id": 1, "file_name": "company_policy.md",
+     "section_title": "Security Policy", "page_number": 2}
+  ]
+}
+```
+
+`POST /chat/stream` trả SSE. Các event types:
+
+| Event | Data | Ý nghĩa |
+|---|---|---|
+| `status` | `{"message": "..."}` | Request đã được nhận, đang retrieval |
+| `token` | `{"text": "..."}` | Token của câu trả lời |
+| `sources` | `{"sources": [...]}` | Sources sau khi generation xong |
+| `error` | `{"code", "message"}` | Lỗi an toàn (không leak nội bộ) |
+| `end` | `{}` | Kết thúc stream |
+
+### Ingestion sync
+
+`make ingest-sync` đồng bộ Qdrant với source directory — file bị xoá khỏi thư mục
+cũng được xoá khỏi DB, scoped theo `INGEST_DATASET_ID`. Sau khi ingest ở terminal
+khác, restart server để BM25 index rebuild (xem Limitations).
+
+Sau khi nâng cấp từ dữ liệu trước PR 8, cần đặt `INGEST_DATASET_ID` rồi chạy full
+`make ingest` một lần để tạo payload/IDs mới. Legacy points thiếu `dataset_id` không
+bị sync tự động; collection dùng chung production cần migration có kiểm soát hoặc
+recreate collection trước khi ingest.
+
 ## 🗺️ Port Map
 
 | Service | Port | Ghi chú |
@@ -121,8 +175,9 @@ Metrics:
 
 ## ⚠️ Limitations
 
-- **Ngôn ngữ:** BM25 tokenizer chỉ hoạt động tốt với ngôn ngữ có dấu cách phân từ
-  (Anh, Việt). CJK chưa hỗ trợ. Dense search thì đa ngôn ngữ bình thường.
+- **Ngôn ngữ:** BM25 tokenizer hỗ trợ Unicode — hoạt động tốt với ngôn ngữ có dấu
+  cách phân từ (Anh, Việt kể cả chữ có dấu). CJK (Trung/Nhật/Hàn) chưa hỗ trợ —
+  cần tokenizer riêng. Dense search thì đa ngôn ngữ bình thường.
 - **Latency:** trên CPU, mỗi câu hỏi mất vài giây đến vài chục giây (2 LLM call +
   cross-encoder rerank). Xem `RERANKER_MODEL_ID` trong `.env` để đổi sang model nhẹ hơn.
 - **Multi-turn:** hỗ trợ cơ bản qua Query Condensation (viết lại follow-up thành câu hỏi
@@ -130,7 +185,8 @@ Metrics:
 - **BM25 index:** build 1 lần trong process. Nếu ingest ở terminal khác với server đang
   chạy, **phải restart server** để BM25 thấy dữ liệu mới. Dense search thì thấy ngay.
 - **Scale:** BM25 giữ toàn bộ corpus trong RAM. Không phù hợp với > ~100k chunk.
-- **Provider Gemini:** chưa được test end-to-end — xem `review/standalone.md`.
+- **Provider Gemini:** đã smoke-test end-to-end với `google-genai 2.15.0`
+  (Interactions API, model `gemini-2.5-flash`) — xem `review/standalone.md` P0-2.
 
 ## 📝 License
 

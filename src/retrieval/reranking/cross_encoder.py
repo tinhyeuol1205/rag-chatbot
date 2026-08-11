@@ -29,7 +29,6 @@ Tham khảo: rag_master.md — Module 5, mục 5.1
 
 from __future__ import annotations
 
-from functools import lru_cache
 from threading import Lock
 
 from sentence_transformers import CrossEncoder
@@ -42,18 +41,27 @@ logger = get_logger(__name__)
 # CrossEncoder không thread-safe khi predict song song → cần lock (liên quan P0-3)
 _predict_lock = Lock()
 
+# Explicit global + lock thay vì lru_cache — same lý do embeddings.py (P2-14):
+# load trùng model khi cold-start đồng thời → RAM nhân đôi/OOM.
+_reranker_model: CrossEncoder | None = None
+_reranker_model_lock = Lock()
 
-@lru_cache(maxsize=1)
+
 def _load_reranker() -> CrossEncoder:
-    """Load 1 lần duy nhất cho cả process (lru_cache module-level)."""
-    logger.info("Loading reranker model", model=settings.RERANKER_MODEL_ID)
-    model = CrossEncoder(
-        settings.RERANKER_MODEL_ID,
-        device=settings.EMBEDDING_DEVICE,   # ★ config này đang bị bỏ qua hoàn toàn
-        max_length=512,                     # ★ chặn input dài → chậm bất định
-    )
-    logger.info("Reranker loaded")
-    return model
+    """Load 1 lần duy nhất cho cả process. Thread-safe (lock + double-check)."""
+    global _reranker_model
+    if _reranker_model is None:             # fast path — không cần lock
+        with _reranker_model_lock:          # slow path — lấy lock
+            if _reranker_model is None:     # double-check LẠI sau khi có lock
+                logger.info("Loading reranker model", model=settings.RERANKER_MODEL_ID)
+                model = CrossEncoder(
+                    settings.RERANKER_MODEL_ID,
+                    device=settings.EMBEDDING_DEVICE,
+                    max_length=512,         # ★ chặn input dài → chậm bất định
+                )
+                _reranker_model = model     # publish chỉ sau load thành công
+                logger.info("Reranker loaded")
+    return _reranker_model
 
 
 class CrossEncoderReranker:

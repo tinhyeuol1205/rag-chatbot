@@ -9,6 +9,8 @@ Tách riêng khỏi retriever để:
 
 from __future__ import annotations
 
+from threading import Lock
+
 from core import get_logger
 from core.errors import RAGChatbotError
 from retrieval.retriever import RAGResult, RAGRetriever
@@ -20,17 +22,23 @@ USER_FACING_ERROR = (
     "Vui lòng thử lại sau ít phút."
 )
 
-# Singleton retriever — load models 1 lần, dùng cho mọi request
+# Singleton retriever — load models 1 lần, dùng cho mọi request.
+# Lock + double-checked: nhiều request cold-start cùng lúc cũng chỉ tạo 1 instance
+# (bug P2-14: check-then-create không lock → 2 thread cùng khởi tạo retriever/model).
 _retriever: RAGRetriever | None = None
+_retriever_lock = Lock()
 
 
 def get_retriever() -> RAGRetriever:
-    """Lazy init retriever (tránh load models khi import)."""
+    """Lazy init retriever (tránh load models khi import). Thread-safe."""
     global _retriever
-    if _retriever is None:
-        logger.info("Initializing RAG Retriever...")
-        _retriever = RAGRetriever()
-        logger.info("RAG Retriever ready")
+    if _retriever is None:          # fast path — không cần lock
+        with _retriever_lock:       # slow path — lấy lock
+            if _retriever is None:  # double-check LẠI sau khi có lock
+                logger.info("Initializing RAG Retriever...")
+                instance = RAGRetriever()
+                _retriever = instance   # publish chỉ sau init thành công
+                logger.info("RAG Retriever ready")
     return _retriever
 
 

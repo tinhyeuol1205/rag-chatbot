@@ -1,8 +1,8 @@
 # 📋 Báo cáo tổng kết — Triển khai toàn bộ Code Review
 
-> **Ngày:** 2026-08-10
-> **Branch:** `dev` — đã merge qua 5 PR + các commit liên quan
-> **Trạng thái:** ✅ Toàn bộ 5 PR + P0-2 + P3-6 hoàn tất, **81 test xanh**
+> **Ngày:** 2026-08-10 (vòng 1) — cập nhật 2026-08-11 (vòng 2, PR 9)
+> **Branch:** `dev` — đã merge qua 5 PR (vòng 1) + PR 6-8 (vòng 2) + PR 9
+> **Trạng thái:** ✅ Vòng 1 + vòng 2 (PR 6-9) hoàn tất, **114 test xanh**
 
 ---
 
@@ -163,3 +163,62 @@ Triệu chứng: turn 2 trả `"Could you please clarify what 'it' refers to"` d
 | `docs/rag_master.md` | Reference chết trong docstring — nên thêm hoặc đổi thành paper gốc |
 | Sparse vector (BM42/SPLADE) | Thay BM25 phía client để scale tốt hơn |
 | Model nhẹ cho reranker | `ms-marco-MiniLM-L-6-v2` nếu muốn latency < 1s trên CPU |
+
+---
+
+## 8. 🔄 Round 2 (PR 6-9) — phát hiện sau khi merge vòng 1
+
+Vòng 2 trong `review/ROUND2-README.md` gồm **7 issues chức năng + 1 nhóm hygiene**, chia 4 PR.
+
+| PR | Nội dung | Issues | Status |
+|---|---|---|---|
+| **6** | Auth đồng nhất, không leak lỗi nội bộ | P1-10, P2-12 | ✅ Hoàn tất (merge PR #6) |
+| **7** | Unicode BM25, citation contract, evaluation đúng context | P1-11, P1-12, P1-13 | ✅ Hoàn tất (merge PR #7) |
+| **8** | Safe replace, sync file đã xoá, dataset isolation | P1-14, P2-13, P2-14→ | ✅ Hoàn tất (merge PR #8) + **re-ingest thêm dataset_id** |
+| **9** | Cold-start concurrency, dependency source, lint/docs | P2-14, P3-8, P3-9 | ✅ Hoàn tất (PR này) |
+
+### PR 9 — chi tiết
+
+**P2-14 Cold-start concurrency** 🔵
+- `chat.py`: `get_retriever()` → lock + double-checked (publish chỉ sau init thành công)
+- `llm.py`: `get_llm_service()` → lock + double-checked
+- `embeddings.py` / `cross_encoder.py`: bỏ `lru_cache` → explicit global + lock
+  (lru_cache không single-flight khi 2 thread cùng miss cache)
+- FastAPI `lifespan`: warmup retriever + models trước khi nhận request, không block
+  event loop (`run_in_threadpool`); đóng Qdrant khi shutdown
+- `retriever.warmup()`: load model sample-free, KHÔNG gọi paid LLM
+- Gradio `main()`: gọi `get_retriever().warmup()` trước launch (fail-fast)
+- Test mới `tests/test_singleton_concurrency.py`: 4 tests, 20 thread × 100 calls
+  → chỉ tạo 1 instance (retriever, LLM, embedding, reranker)
+
+**P3-8 Ruff quality gate** 🔵
+- `ruff check src tests` đã sạch (trước: 17 lỗi). Autofix + sửa tay:
+  - `qdrant.py` `create_payload_index`: chỉ catch `UnexpectedResponse` status 409
+    (index đã tồn tại); network/auth lỗi propagate (trước: catch mọi Exception)
+  - `BLE001` chủ đích (condense/hyde/multi_query) → `# noqa` dòng + giải thích invariant
+  - `PYI034` `__new__` → `Self`; `PYI063` → PEP 570 `/`; `SIM102`, `C401`, `I001`, `PIE790`
+- Make targets mới: `make lint`, `make check`
+- CI mới: `.github/workflows/ci.yml` (ruff + pytest + `uv lock --check`, `--locked`)
+
+**P3-9 Dependency & docs drift** 🔵
+- Xoá `requirements.txt` — một nguồn sự thật duy nhất = `pyproject.toml` + `uv.lock`
+- Pin Qdrant `qdrant/qdrant:latest` → `qdrant/qdrant:v1.18.3` (version đang chạy,
+  khớp qdrant-client 1.19.0)
+- README: Python range `>=3.10,<3.13`; `uv sync --locked`; API section mới (auth
+  `X-API-Key`, response schema, SSE event types, `make ingest-sync`); Gemini đã test
+  end-to-end; BM25 Unicode hỗ trợ tiếng Việt có dấu
+- `main.py` docstring: port 8000 → 8080
+
+**Definition of Done PR 9:**
+
+| Hạng mục | Kết quả |
+|---|---|
+| 20 thread cold-start → 1 retriever/LLM/model | ✅ `test_singleton_concurrency.py` 4/4 pass |
+| API lifespan warmup trước request | ✅ `/health` OK sau "Application ready" |
+| `ruff check src tests` | ✅ All checks passed |
+| `make test` | ✅ **114 passed** (81 + 33 mới từ PR 6-8) |
+| `uv lock --check` | ✅ Resolved 249 packages |
+| `uv pip check` | ✅ 203 packages compatible |
+| Một dependency source | ✅ `pyproject.toml` + `uv.lock` (xoá `requirements.txt`) |
+| README khớp thực tế | ✅ API/schema/SSE/Python range/ingestion sync |
+| `/chat` end-to-end | ✅ 200 + real sources (citation 1-5, section title thật) |

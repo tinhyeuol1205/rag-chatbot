@@ -58,7 +58,7 @@ class QueryCondenser:
                 user_prompt=CONDENSE_PROMPT.format(history=history_text, question=question),
                 temperature=0.0, max_tokens=150,
             ).strip()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - optional LLM enhancement must degrade
             # Cùng nguyên tắc graceful degradation như PR 1 / P1-7
             logger.warning("Condensation failed, using original question", error=str(e))
             return question

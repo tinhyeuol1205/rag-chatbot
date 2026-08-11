@@ -6,32 +6,57 @@ Endpoints:
   POST /chat/stream   — Chat (SSE streaming response)
   GET  /health        — Health check
 
-Chạy bằng: make run-api
-Hoặc:      uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+Chạy bằng: make run-api (host 127.0.0.1:8080)
+Hoặc:      uvicorn api.main:app --host 127.0.0.1 --port 8080 --reload
 """
 
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from secrets import compare_digest
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
-from starlette.concurrency import iterate_in_threadpool
+from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 
-from api.chat import USER_FACING_ERROR, chat_or_raise_with_sources, chat_stream_events
+from api.chat import (
+    USER_FACING_ERROR,
+    chat_or_raise_with_sources,
+    chat_stream_events,
+    get_retriever,
+)
 from core import get_logger
 from core.config import settings
+from core.db import QdrantConnector
 from core.errors import RAGChatbotError
 
 logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Warmup models trước khi nhận request — không block event loop.
+
+    get_retriever() là sync + nặng (load embedding/reranker model) → chạy trong
+    threadpool. KHÔNG gọi external paid LLM ở startup (bug P2-14).
+    """
+    retriever = await run_in_threadpool(get_retriever)
+    await run_in_threadpool(retriever.warmup)
+    logger.info("Application ready")
+    try:
+        yield
+    finally:
+        QdrantConnector().close()
+
 
 app = FastAPI(
     title="RAG Chatbot API",
     description="Internal Knowledge Base Assistant with Advanced RAG",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 
