@@ -1,7 +1,5 @@
 """Regression tests for API-key enforcement on both chat endpoints."""
 
-import pytest
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import api.main as api_main
