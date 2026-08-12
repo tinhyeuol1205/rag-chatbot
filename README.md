@@ -22,8 +22,8 @@ Documents (PDF/DOCX/MD)
         │
         ▼
 ┌── Ingestion Pipeline ──┐
-│ Parse → Chunk → Embed  │──────► Qdrant Vector DB
-│ (Parent-Child strategy) │       (child_chunks + parent_chunks)
+│ Stream → Chunk → Embed │──────► Qdrant staging generation
+│ (Parent-Child strategy) │       (atomic retrieval aliases)
 └─────────────────────────┘
                                          │
 User Query                               │
@@ -86,6 +86,8 @@ src/
 │   ├── parsers/            # PDF, Markdown, DOCX parsers (Strategy pattern)
 │   ├── chunking/           # Recursive + Parent-Child chunking
 │   ├── embeddings.py       # bge-small-en embedding service
+│   ├── batching.py          # point/byte bounded request batches
+│   ├── manifest.py          # SQLite source manifest + checkpoints
 │   └── pipeline.py         # Orchestrator
 ├── retrieval/              # Advanced RAG retrieval pipeline
 │   ├── query_transform/    # Multi-Query Expansion + HyDE
@@ -165,8 +167,40 @@ Sau khi ingest ở terminal khác, restart server để BM25 index rebuild (xem 
 
 Sau khi nâng cấp từ dữ liệu trước PR 8, cần đặt `INGEST_DATASET_ID` rồi chạy full
 `make ingest` một lần để tạo payload/IDs mới. Legacy points thiếu `dataset_id` không
-bị sync tự động; collection dùng chung production cần migration có kiểm soát hoặc
-recreate collection trước khi ingest.
+bị sync tự động. PR11 ghi generation mới vào các collection dạng
+`child_chunks_active__<generation>`/`parent_chunks_active__<generation>`, rồi switch
+hai alias `child_chunks_active` và `parent_chunks_active` atomically. Dữ liệu cũ cần
+backfill qua staging; không mutate collection production đang active.
+
+Manifest mặc định ở `data/ingest_runs/manifest.sqlite3` và phải đặt trên volume bền
+vững khi chạy nhiều container. Có thể resume một job cụ thể:
+
+```bash
+PYTHONPATH=src rag/bin/python -m ingestion.main \
+  --data-dir data/real-docs --sync --job-id nightly-2026-08-12
+```
+
+Xem trước mà không ghi Qdrant:
+
+```bash
+PYTHONPATH=src rag/bin/python -m ingestion.main \
+  --data-dir data/real-docs --sync --dry-run --summary-path /tmp/ingest-plan.json
+```
+
+Rollback về generation đã giữ lại:
+
+```bash
+PYTHONPATH=src rag/bin/python - <<'PY'
+from ingestion.pipeline import IngestionPipeline
+IngestionPipeline().rollback("<generation-id>")
+PY
+```
+
+Các generation đã commit cũ hơn `INGEST_GENERATION_RETENTION` sẽ được dọn sau
+khi activation thành công; generation lỗi vẫn được giữ để điều tra.
+
+Xem bảng thay đổi source và hướng dẫn dev/test, backfill, load test, rollback:
+[docs/pr11-changes-and-deployment.md](docs/pr11-changes-and-deployment.md).
 
 ## 🗺️ Port Map
 
@@ -186,9 +220,10 @@ recreate collection trước khi ingest.
   cross-encoder rerank). Xem `RERANKER_MODEL_ID` trong `.env` để đổi sang model nhẹ hơn.
 - **Multi-turn:** hỗ trợ cơ bản qua Query Condensation (viết lại follow-up thành câu hỏi
   độc lập). Giới hạn: chỉ nhìn 3 lượt gần nhất, tốn thêm 1 LLM call mỗi câu hỏi có history.
-- **BM25 index:** build 1 lần trong process. Nếu ingest ở terminal khác với server đang
-  chạy, **phải restart server** để BM25 thấy dữ liệu mới. Dense search thì thấy ngay.
-- **Scale:** BM25 giữ toàn bộ corpus trong RAM. Không phù hợp với > ~100k chunk.
+- **BM25 index:** build 1 lần trong process. Ingestion generation mới sẽ invalidate
+  cache local; nếu ingest ở process khác, restart server để BM25 thấy dữ liệu mới.
+- **Scale:** ingestion đã giới hạn memory theo file/window và batch/byte budget. BM25
+  vẫn giữ toàn bộ corpus trong RAM; retrieval lớn hơn khoảng 100k chunk cần PR12.
 - **Provider Gemini:** đã smoke-test end-to-end với `google-genai 2.15.0`
   (Interactions API, model `gemini-2.5-flash`) — xem `review/standalone.md` P0-2.
 

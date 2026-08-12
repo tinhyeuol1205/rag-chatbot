@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -28,6 +29,16 @@ class DocumentMetadata(BaseModel):
     section_title: str | None = None
     source_path: str = ""
     dataset_id: str = ""
+    source_uri: str = ""
+    document_version: str = ""
+    structural_anchor: str = ""
+    element_type: str = ""
+    offset_start: int | None = None
+    offset_end: int | None = None
+    bbox: tuple[float, float, float, float] | None = None
+    content_sha256: str = ""
+    generation_id: str = ""
+    pipeline_fingerprint: str = ""
 
 
 class RawDocument(BaseModel):
@@ -38,6 +49,32 @@ class RawDocument(BaseModel):
 
     content: str
     metadata: DocumentMetadata
+
+
+class ParseQuality(BaseModel):
+    """Counters describing parser output quality for one source file."""
+
+    pages_seen: int = 0
+    pages_empty: int = 0
+    ocr_pages: int = 0
+    table_elements: int = 0
+    image_elements: int = 0
+    caption_elements: int = 0
+    unsupported_elements: int = 0
+    elements_seen: int = 0
+    documents_emitted: int = 0
+    characters_emitted: int = 0
+    replacement_characters: int = 0
+
+    def merge(self, other: ParseQuality) -> ParseQuality:
+        """Return a counter-wise sum without mutating either operand."""
+        values: dict[str, Any] = {}
+        for field_name in self.model_fields:
+            values[field_name] = getattr(self, field_name) + getattr(other, field_name)
+        return ParseQuality(**values)
+
+    def as_dict(self) -> dict[str, int]:
+        return self.model_dump()
 
 
 class Chunk(BaseModel):
@@ -74,7 +111,7 @@ class Chunk(BaseModel):
         digest = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
         key = (
             f"{self.metadata.dataset_id}|"
-            f"{self.metadata.source_path or self.metadata.file_name}|"
+            f"{self.metadata.source_uri or self.metadata.source_path or self.metadata.file_name}|"
             f"{self.position}|{digest}"
         )
         return str(uuid.uuid5(_NAMESPACE, key))

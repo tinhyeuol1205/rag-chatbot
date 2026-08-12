@@ -19,18 +19,22 @@ Usage:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import uuid
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
+from itertools import chain
 from pathlib import Path
 
-from qdrant_client.models import PointStruct
+from qdrant_client.models import Distance, PointStruct
 
 from core import get_logger
 from core.config import settings
 from core.db import QdrantConnector
-from ingestion.chunking.parent_child import parent_child_chunk
+from ingestion.batching import iter_batches
+from ingestion.chunking.parent_child import iter_parent_child_chunks, parent_child_chunk
 from ingestion.embeddings import EmbeddingService
-from ingestion.models import Chunk, EmbeddedChunk, RawDocument
+from ingestion.manifest import ManifestStore, pipeline_fingerprint, sha256_file
+from ingestion.models import Chunk, EmbeddedChunk, ParseQuality, RawDocument
 from ingestion.parsers import ParserDispatcher
 
 logger = get_logger(__name__)
@@ -43,6 +47,7 @@ class ParseBatch:
     discovered_files: set[str] = field(default_factory=set)
     documents_by_file: dict[str, list[RawDocument]] = field(default_factory=dict)
     failed_files: set[str] = field(default_factory=set)
+    quality_by_file: dict[str, ParseQuality] = field(default_factory=dict)
 
 
 @dataclass
@@ -67,6 +72,10 @@ class IngestionResult:
     prune_skipped: bool = False
     planned_pruned_files: set[str] = field(default_factory=set)
     dry_run: bool = False
+    job_id: str | None = None
+    generation_id: str | None = None
+    skipped_files: set[str] = field(default_factory=set)
+    quality_by_file: dict[str, dict] = field(default_factory=dict)
 
 
 class IngestionPipeline:
@@ -75,8 +84,9 @@ class IngestionPipeline:
     def __init__(self):
         self.qdrant = QdrantConnector()
         self.embedder = EmbeddingService()
+        self.manifest = ManifestStore()
 
-    def run(
+    def _run_legacy(
         self,
         data_dir: str,
         *,
@@ -209,6 +219,691 @@ class IngestionPipeline:
             if bm25_may_be_dirty:
                 self._invalidate_bm25_index()
 
+    def run(
+        self,
+        data_dir: str,
+        *,
+        sync: bool = False,
+        allow_empty_source: bool = False,
+        dry_run: bool = False,
+        job_id: str | None = None,
+        generation_id: str | None = None,
+        resume: bool = True,
+    ) -> IngestionResult:
+        """Run bounded, manifest-backed, versioned ingestion.
+
+        Objects created by older tests/callers with ``__new__`` do not have a
+        manifest.  They deliberately retain the PR10 safe-replace path so the
+        compatibility contract remains intact; normal construction always uses
+        the versioned path.
+        """
+        if not hasattr(self, "manifest") or not settings.INGEST_VERSIONED:
+            return self._run_legacy(
+                data_dir,
+                sync=sync,
+                allow_empty_source=allow_empty_source,
+                dry_run=dry_run,
+            )
+        return self._run_versioned(
+            data_dir,
+            sync=sync,
+            allow_empty_source=allow_empty_source,
+            dry_run=dry_run,
+            job_id=job_id,
+            generation_id=generation_id,
+            resume=resume,
+        )
+
+    def _run_versioned(
+        self,
+        data_dir: str,
+        *,
+        sync: bool,
+        allow_empty_source: bool,
+        dry_run: bool,
+        job_id: str | None,
+        generation_id: str | None,
+        resume: bool,
+    ) -> IngestionResult:
+        data_path = Path(data_dir)
+        if not data_path.exists():
+            raise FileNotFoundError(f"Data directory not found: {data_dir}")
+        if not data_path.is_dir():
+            raise NotADirectoryError(f"Data path is not a directory: {data_dir}")
+
+        existing_job = self.manifest.get_job(job_id) if job_id else None
+        if existing_job and resume:
+            generation_id = generation_id or existing_job["generation_id"]
+        else:
+            generation_id = generation_id or uuid.uuid4().hex[:16]
+        job_id = job_id or uuid.uuid4().hex
+        vector_dimension = self.embedder.dimension
+        fingerprint = pipeline_fingerprint(embedding_dimension=vector_dimension)
+        active_sources = self.manifest.list_sources(settings.INGEST_DATASET_ID)
+        previous_generation = next(
+            (
+                record.active_generation
+                for record in active_sources
+                # A failed working run must not erase the last active
+                # generation from the manifest.  The source row can be
+                # ``failed`` while its ``active_generation`` still points at
+                # the serving snapshot.
+                if record.active_generation
+            ),
+            None,
+        )
+        previous_records = (
+            self.manifest.list_sources(
+                settings.INGEST_DATASET_ID,
+                active_generation=previous_generation,
+            )
+            if previous_generation else []
+        )
+        if not resume and existing_job:
+            raise ValueError(f"ingestion job already exists: {job_id}")
+        self.manifest.create_job(
+            job_id=job_id,
+            dataset_id=settings.INGEST_DATASET_ID,
+            generation_id=generation_id,
+            fingerprint=fingerprint,
+            active_generation_before=previous_generation,
+        )
+
+        if dry_run:
+            return self._dry_run_versioned(
+                data_path,
+                sync=sync,
+                allow_empty_source=allow_empty_source,
+                job_id=job_id,
+                generation_id=generation_id,
+                fingerprint=fingerprint,
+            )
+
+        source_iterator = self._iter_source_files(data_path)
+        first_source = next(source_iterator, None)
+        if sync and first_source is None and not allow_empty_source:
+            self.manifest.finish_job(job_id=job_id, status="failed")
+            raise ValueError(
+                "Refusing destructive sync from an empty source. "
+                "Verify the mount/path, or pass allow_empty_source=True explicitly."
+            )
+
+        child_collection, parent_collection = self.qdrant.create_generation_collections(
+            generation_id,
+            schema_fingerprint=fingerprint,
+            vector_dimension=vector_dimension,
+        )
+        previous_child = (
+            f"{settings.CHILD_COLLECTION}__{previous_generation}"
+            if previous_generation else self.qdrant.alias_target(settings.CHILD_COLLECTION)
+        )
+        previous_parent = (
+            f"{settings.PARENT_COLLECTION}__{previous_generation}"
+            if previous_generation else self.qdrant.alias_target(settings.PARENT_COLLECTION)
+        )
+        discovered: set[str] = set()
+        active_source_uris: set[str] = set()
+        processed: set[str] = set()
+        skipped: set[str] = set()
+        failed: set[str] = set()
+        quality_by_file: dict[str, dict] = {}
+        stale: set[str] = set()
+
+        try:
+            for source in chain(([first_source] if first_source else []), source_iterator):
+                discovered.add(source["source_uri"])
+                active_source_uris.add(source["source_uri"])
+                source_uri = source["source_uri"]
+                content_hash = sha256_file(source["path"])
+                previous = self.manifest.record_discovered(
+                    dataset_id=settings.INGEST_DATASET_ID,
+                    source_uri=source_uri,
+                    content_sha256=content_hash,
+                    size_bytes=source["size_bytes"],
+                    mtime_ns=source["mtime_ns"],
+                    fingerprint=fingerprint,
+                    generation_id=generation_id,
+                )
+                unchanged = bool(
+                    previous
+                    and previous.status == "committed"
+                    and previous.content_sha256 == content_hash
+                    and previous.fingerprint == fingerprint
+                    and previous_generation
+                    and previous.active_generation == previous_generation
+                )
+                if unchanged and previous_child and previous_parent:
+                    copied_children = self.qdrant.copy_source_points(
+                        previous_child,
+                        child_collection,
+                        dataset_id=settings.INGEST_DATASET_ID,
+                        source_uri=source_uri,
+                        with_vectors=True,
+                        target_generation_id=generation_id,
+                    )
+                    copied_parents = self.qdrant.copy_source_points(
+                        previous_parent,
+                        parent_collection,
+                        dataset_id=settings.INGEST_DATASET_ID,
+                        source_uri=source_uri,
+                        with_vectors=False,
+                        target_generation_id=generation_id,
+                    )
+                    if copied_children < previous.child_count or copied_parents < previous.parent_count:
+                        raise ValueError(
+                            f"unchanged source is incomplete in previous generation: {source_uri}"
+                        )
+                    self.manifest.mark_source(
+                        dataset_id=settings.INGEST_DATASET_ID,
+                        source_uri=source_uri,
+                        status="committed",
+                        generation_id=generation_id,
+                        parent_count=previous.parent_count,
+                        child_count=previous.child_count,
+                        quality=previous.quality,
+                    )
+                    skipped.add(source_uri)
+                    continue
+
+                try:
+                    parser = ParserDispatcher.get_parser(source["path"])
+                    documents, quality = parser.parse_with_quality(source["path"])
+                    quality_by_file[source_uri] = quality.as_dict()
+                    if not self._quality_acceptable(quality, documents):
+                        raise ValueError("parser_quality_threshold_exceeded")
+                    documents = [self._normalize_document(document, source_uri, content_hash) for document in documents]
+                    parent_count, child_count = self._ingest_source(
+                        documents,
+                        source_uri=source_uri,
+                        content_sha256=content_hash,
+                        fingerprint=fingerprint,
+                        generation_id=generation_id,
+                        child_collection=child_collection,
+                        parent_collection=parent_collection,
+                    )
+                    if parent_count <= 0 or child_count <= 0:
+                        raise ValueError("no_chunks_emitted")
+                    self.manifest.mark_source(
+                        dataset_id=settings.INGEST_DATASET_ID,
+                        source_uri=source_uri,
+                        status="committed",
+                        generation_id=generation_id,
+                        parent_count=parent_count,
+                        child_count=child_count,
+                        quality=quality.as_dict(),
+                    )
+                    processed.add(source_uri)
+                except Exception as exc:
+                    failed.add(source_uri)
+                    self.manifest.mark_source(
+                        dataset_id=settings.INGEST_DATASET_ID,
+                        source_uri=source_uri,
+                        status="failed",
+                        generation_id=generation_id,
+                        quality=quality_by_file.get(source_uri),
+                        error_code=type(exc).__name__,
+                    )
+                    logger.exception("Failed to ingest source", source=source_uri)
+
+            # A non-sync run is additive: source files not present in this
+            # invocation must be copied from the previous active generation.
+            # Otherwise every ordinary incremental run would silently drop old
+            # documents because staging starts empty.
+            if not sync and previous_child and previous_parent:
+                for record in previous_records:
+                    if record.source_uri in discovered:
+                        continue
+                    copied_children = self.qdrant.copy_source_points(
+                        previous_child,
+                        child_collection,
+                        dataset_id=settings.INGEST_DATASET_ID,
+                        source_uri=record.source_uri,
+                        with_vectors=True,
+                        target_generation_id=generation_id,
+                    )
+                    copied_parents = self.qdrant.copy_source_points(
+                        previous_parent,
+                        parent_collection,
+                        dataset_id=settings.INGEST_DATASET_ID,
+                        source_uri=record.source_uri,
+                        with_vectors=False,
+                        target_generation_id=generation_id,
+                    )
+                    if (
+                        record.status != "rolled_back"
+                        and (copied_children < record.child_count or copied_parents < record.parent_count)
+                    ):
+                        raise ValueError(
+                            f"carried-forward source is incomplete in previous generation: {record.source_uri}"
+                        )
+                    self.manifest.mark_source(
+                        dataset_id=settings.INGEST_DATASET_ID,
+                        source_uri=record.source_uri,
+                        status="committed",
+                        generation_id=generation_id,
+                        parent_count=copied_parents,
+                        child_count=copied_children,
+                        quality=record.quality,
+                    )
+                    active_source_uris.add(record.source_uri)
+
+            if sync:
+                stale = (
+                    {
+                        record.source_uri
+                        for record in self.manifest.list_sources(
+                            settings.INGEST_DATASET_ID,
+                            active_generation=previous_generation,
+                        )
+                        if record.source_uri not in discovered
+                    }
+                    if previous_generation else set()
+                )
+                if failed:
+                    logger.warning("Skipping stale source removal because ingestion failed", failed=sorted(failed))
+
+            if failed:
+                self.manifest.finish_job(
+                    job_id=job_id,
+                    status="failed",
+                    summary={"failed_files": sorted(failed), "generation_id": generation_id},
+                )
+                return IngestionResult(
+                    dataset_id=settings.INGEST_DATASET_ID,
+                    discovered_files=discovered,
+                    processed_files=processed,
+                    failed_files=failed,
+                    job_id=job_id,
+                    generation_id=generation_id,
+                    skipped_files=skipped,
+                    quality_by_file=quality_by_file,
+                    prune_skipped=sync,
+                )
+
+            self._validate_generation(child_collection, parent_collection)
+            self.qdrant.switch_aliases(
+                child_collection=child_collection,
+                parent_collection=parent_collection,
+            )
+            self.manifest.activate_generation(
+                dataset_id=settings.INGEST_DATASET_ID,
+                generation_id=generation_id,
+                source_uris=active_source_uris,
+            )
+            self.manifest.mark_removed(
+                dataset_id=settings.INGEST_DATASET_ID,
+                source_uris=stale,
+            )
+            self.manifest.finish_job(
+                job_id=job_id,
+                status="committed",
+                active_generation_after=generation_id,
+                summary={
+                    "processed_files": sorted(processed),
+                    "skipped_files": sorted(skipped),
+                    "generation_id": generation_id,
+                },
+            )
+            self._prune_old_generations(generation_id)
+            self._invalidate_bm25_index()
+            return IngestionResult(
+                dataset_id=settings.INGEST_DATASET_ID,
+                discovered_files=discovered,
+                processed_files=processed,
+                skipped_files=skipped,
+                generation_id=generation_id,
+                job_id=job_id,
+                quality_by_file=quality_by_file,
+            )
+        except Exception:
+            self.manifest.finish_job(job_id=job_id, status="failed")
+            raise
+
+    def _dry_run_versioned(
+        self,
+        data_path: Path,
+        *,
+        sync: bool,
+        allow_empty_source: bool,
+        job_id: str,
+        generation_id: str,
+        fingerprint: str,
+    ) -> IngestionResult:
+        discovered: set[str] = set()
+        skipped: set[str] = set()
+        for source in self._iter_source_files(data_path):
+            source_uri = source["source_uri"]
+            discovered.add(source_uri)
+            content_hash = sha256_file(source["path"])
+            previous = self.manifest.get_source(settings.INGEST_DATASET_ID, source_uri)
+            if previous and previous.status == "committed" and previous.content_sha256 == content_hash and previous.fingerprint == fingerprint:
+                skipped.add(source_uri)
+        active_records = self.manifest.list_sources(settings.INGEST_DATASET_ID)
+        previous_generation = next(
+            (
+                record.active_generation
+                for record in active_records
+                if record.active_generation
+            ),
+            None,
+        )
+        planned_pruned_files = (
+            {
+                record.source_uri
+                for record in self.manifest.list_sources(
+                    settings.INGEST_DATASET_ID,
+                    active_generation=previous_generation,
+                )
+                if record.source_uri not in discovered
+            }
+            if sync and previous_generation
+            else set()
+        )
+        if sync and not discovered and not allow_empty_source:
+            self.manifest.finish_job(job_id=job_id, status="failed")
+            raise ValueError("Refusing destructive sync from an empty source")
+        self.manifest.finish_job(
+            job_id=job_id,
+            status="dry_run",
+            summary={
+                "discovered": sorted(discovered),
+                "skipped": sorted(skipped),
+                "planned_pruned_files": sorted(planned_pruned_files),
+            },
+        )
+        return IngestionResult(
+            dataset_id=settings.INGEST_DATASET_ID,
+            discovered_files=discovered,
+            skipped_files=skipped,
+            planned_pruned_files=planned_pruned_files,
+            dry_run=True,
+            job_id=job_id,
+            generation_id=generation_id,
+        )
+
+    def _iter_source_files(self, data_path: Path) -> Iterator[dict]:
+        supported = set(ParserDispatcher.supported_extensions())
+        for path in data_path.rglob("*"):
+            if path.is_file() and path.suffix.lower() in supported:
+                relative = path.relative_to(data_path).as_posix()
+                stat = path.stat()
+                yield {
+                    "path": path,
+                    "source_uri": relative,
+                    "size_bytes": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+
+    @staticmethod
+    def _normalize_document(document: RawDocument, source_uri: str, content_sha256: str) -> RawDocument:
+        return document.model_copy(update={
+            "metadata": document.metadata.model_copy(update={
+                "dataset_id": settings.INGEST_DATASET_ID,
+                "file_name": source_uri,
+                "source_path": source_uri,
+                "source_uri": source_uri,
+                "content_sha256": content_sha256,
+            }),
+        })
+
+    @staticmethod
+    def _quality_acceptable(quality: ParseQuality, documents: list[RawDocument]) -> bool:
+        if not documents:
+            return False
+        if not settings.INGEST_FAIL_ON_QUALITY:
+            return True
+        if any(len(document.content.strip()) < settings.INGEST_PARSER_MIN_TEXT_CHARS for document in documents):
+            return False
+        if quality.characters_emitted <= 0:
+            return False
+        if quality.pages_seen and quality.pages_empty / quality.pages_seen > settings.INGEST_PARSER_MAX_EMPTY_PAGE_RATIO:
+            return False
+        if quality.elements_seen and quality.unsupported_elements / quality.elements_seen > settings.INGEST_PARSER_MAX_UNSUPPORTED_RATIO:
+            return False
+        replacement_ratio = quality.replacement_characters / max(quality.characters_emitted, 1)
+        return replacement_ratio <= settings.INGEST_PARSER_MAX_REPLACEMENT_RATIO
+
+    def _ingest_source(
+        self,
+        documents: list[RawDocument],
+        *,
+        source_uri: str,
+        content_sha256: str,
+        fingerprint: str,
+        generation_id: str,
+        child_collection: str,
+        parent_collection: str,
+    ) -> tuple[int, int]:
+        parent_count = 0
+        child_count = 0
+        child_batch_index = 0
+        for parent_batch_index, (parents, children) in enumerate(iter_parent_child_chunks(documents)):
+            parent_points = [self._parent_point(chunk, generation_id) for chunk in parents]
+            parent_key = f"{source_uri}:parent:{parent_batch_index}"
+            parent_ids = [str(point.id) for point in parent_points]
+            if not self._checkpoint_complete(
+                source_uri, generation_id, parent_key, parent_collection, parent_ids, content_sha256, fingerprint
+            ):
+                self.qdrant.upsert_points(parent_collection, parent_points)
+            self.manifest.record_batch(
+                dataset_id=settings.INGEST_DATASET_ID,
+                generation_id=generation_id,
+                source_uri=source_uri,
+                batch_key=parent_key,
+                collection_name=parent_collection,
+                point_ids=parent_ids,
+                content_sha256=content_sha256,
+                fingerprint=fingerprint,
+            )
+            parent_count += len(parent_points)
+
+            for child_batch in iter_batches(
+                children,
+                max_items=settings.INGEST_EMBED_BATCH_SIZE,
+                max_bytes=max(settings.INGEST_QDRANT_WRITE_MAX_BYTES, 1),
+                size_of=lambda chunk: len(chunk.content.encode("utf-8")) + 256,
+            ):
+                child_ids = [chunk.chunk_id for chunk in child_batch]
+                child_key = f"{source_uri}:child:{child_batch_index}"
+                checkpointed = self._checkpoint_complete(
+                    source_uri, generation_id, child_key, child_collection, child_ids, content_sha256, fingerprint
+                )
+                if not checkpointed:
+                    vectors = self.embedder.embed([chunk.content for chunk in child_batch])
+                    child_points = [self._child_point(chunk, vector, generation_id) for chunk, vector in zip(child_batch, vectors)]
+                    self.qdrant.upsert_points(child_collection, child_points)
+                self.manifest.record_batch(
+                    dataset_id=settings.INGEST_DATASET_ID,
+                    generation_id=generation_id,
+                    source_uri=source_uri,
+                    batch_key=child_key,
+                    collection_name=child_collection,
+                    point_ids=child_ids,
+                    content_sha256=content_sha256,
+                    fingerprint=fingerprint,
+                )
+                child_count += len(child_batch)
+                child_batch_index += 1
+        return parent_count, child_count
+
+    def _checkpoint_complete(
+        self,
+        source_uri: str,
+        generation_id: str,
+        batch_key: str,
+        collection_name: str,
+        point_ids: list[str],
+        content_sha256: str,
+        fingerprint: str,
+    ) -> bool:
+        checkpoint = self.manifest.batch_committed(
+            dataset_id=settings.INGEST_DATASET_ID,
+            generation_id=generation_id,
+            source_uri=source_uri,
+            batch_key=batch_key,
+            collection_name=collection_name,
+            content_sha256=content_sha256,
+            fingerprint=fingerprint,
+        )
+        candidate_ids = checkpoint or point_ids
+        existing_ids = self.qdrant.get_existing_ids(collection_name, candidate_ids)
+        return existing_ids >= set(point_ids)
+
+    @staticmethod
+    def _parent_point(chunk: Chunk, generation_id: str) -> PointStruct:
+        metadata = chunk.metadata
+        return PointStruct(
+            id=chunk.chunk_id,
+            vector={},
+            payload={
+                "content": chunk.content,
+                "parent_id": None,
+                "file_name": metadata.file_name,
+                "file_type": metadata.file_type,
+                "source_path": metadata.source_path,
+                "source_uri": metadata.source_uri or metadata.source_path,
+                "dataset_id": metadata.dataset_id,
+                "generation_id": generation_id,
+                "document_version": metadata.document_version,
+                "content_sha256": metadata.content_sha256,
+                "section_title": metadata.section_title,
+                "page_number": metadata.page_number,
+                "structural_anchor": metadata.structural_anchor,
+            },
+        )
+
+    @staticmethod
+    def _child_point(chunk: Chunk, vector: list[float], generation_id: str) -> PointStruct:
+        metadata = chunk.metadata
+        return PointStruct(
+            id=chunk.chunk_id,
+            vector=vector,
+            payload={
+                "content": chunk.content,
+                "parent_id": chunk.parent_id,
+                "file_name": metadata.file_name,
+                "file_type": metadata.file_type,
+                "source_path": metadata.source_path,
+                "source_uri": metadata.source_uri or metadata.source_path,
+                "dataset_id": metadata.dataset_id,
+                "generation_id": generation_id,
+                "document_version": metadata.document_version,
+                "content_sha256": metadata.content_sha256,
+                "section_title": metadata.section_title,
+                "page_number": metadata.page_number,
+                "structural_anchor": metadata.structural_anchor,
+            },
+        )
+
+    def _validate_generation(self, child_collection: str, parent_collection: str) -> None:
+        """Run bounded integrity checks before aliases can become visible."""
+        # Sample child references and resolve exactly those parent IDs.  Keeping
+        # the first 10k parent IDs would falsely reject a large generation when
+        # a sampled child points to a parent outside that arbitrary prefix.
+        sample_parent_ids: set[str] = set()
+        for point in self.qdrant.iter_scroll(
+            child_collection,
+            batch_size=settings.INGEST_QDRANT_WRITE_BATCH_SIZE,
+            with_payload=True,
+            with_vectors=False,
+            max_points=10_000,
+        ):
+            parent_id = (point.payload or {}).get("parent_id")
+            if parent_id:
+                sample_parent_ids.add(str(parent_id))
+        sample_missing: list[str] = []
+        for batch in iter_batches(
+            sorted(sample_parent_ids),
+            max_items=settings.INGEST_QDRANT_WRITE_BATCH_SIZE,
+            max_bytes=settings.INGEST_QDRANT_WRITE_MAX_BYTES,
+            size_of=lambda value: len(value) + 64,
+        ):
+            found = {str(point.id) for point in self.qdrant.get_by_ids(parent_collection, batch)}
+            sample_missing.extend(sorted(set(batch) - found))
+            if len(sample_missing) >= 10:
+                break
+        if sample_missing:
+            raise ValueError(f"child-parent referential integrity failed: {sample_missing}")
+
+    def rollback(self, generation_id: str) -> None:
+        """Atomically restore retrieval aliases to a retained generation."""
+        if not generation_id or any(
+            char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for char in generation_id
+        ):
+            raise ValueError("generation_id contains unsupported collection-name characters")
+        child_collection = f"{settings.CHILD_COLLECTION}__{generation_id}"
+        parent_collection = f"{settings.PARENT_COLLECTION}__{generation_id}"
+        if not self.qdrant._collection_exists(child_collection) or not self.qdrant._collection_exists(parent_collection):
+            raise ValueError(f"generation not found or incomplete: {generation_id}")
+        fingerprint = pipeline_fingerprint(embedding_dimension=self.embedder.dimension)
+        self.qdrant.validate_collection_schema(
+            child_collection,
+            schema_fingerprint=fingerprint,
+            vector_dimension=self.embedder.dimension,
+            expected_distance=Distance.COSINE,
+            required_payload_indexes=("dataset_id", "file_name", "source_uri", "generation_id"),
+        )
+        self.qdrant.validate_collection_schema(
+            parent_collection,
+            schema_fingerprint=fingerprint,
+            vector_dimension=None,
+            expected_distance=None,
+            required_payload_indexes=("dataset_id", "file_name", "source_uri", "generation_id"),
+        )
+        self._validate_generation(child_collection, parent_collection)
+        self.qdrant.switch_aliases(
+            child_collection=child_collection,
+            parent_collection=parent_collection,
+        )
+        source_uris = (
+            self.qdrant.list_file_names_by_dataset(
+                child_collection,
+                dataset_id=settings.INGEST_DATASET_ID,
+            )
+            | self.qdrant.list_file_names_by_dataset(
+                parent_collection,
+                dataset_id=settings.INGEST_DATASET_ID,
+            )
+        )
+        self.manifest.mark_rollback(
+            dataset_id=settings.INGEST_DATASET_ID,
+            generation_id=generation_id,
+            source_uris=source_uris,
+        )
+        self._invalidate_bm25_index()
+
+    def _prune_old_generations(self, active_generation: str) -> None:
+        """Delete committed staging generations outside the rollback window."""
+        keep = set(
+            self.manifest.committed_generations(
+                settings.INGEST_DATASET_ID,
+                limit=settings.INGEST_GENERATION_RETENTION,
+            )
+        )
+        keep.add(active_generation)
+        active_targets = {
+            self.qdrant.alias_target(settings.CHILD_COLLECTION),
+            self.qdrant.alias_target(settings.PARENT_COLLECTION),
+        }
+        for generation in self.manifest.committed_generations(
+            settings.INGEST_DATASET_ID,
+            limit=max(settings.INGEST_GENERATION_RETENTION + 100, 100),
+        ):
+            if generation in keep:
+                continue
+            child_collection = f"{settings.CHILD_COLLECTION}__{generation}"
+            parent_collection = f"{settings.PARENT_COLLECTION}__{generation}"
+            if child_collection in active_targets or parent_collection in active_targets:
+                continue
+            try:
+                self.qdrant.delete_collection(child_collection)
+                self.qdrant.delete_collection(parent_collection)
+            except Exception:
+                # Activation already succeeded; retention cleanup must not turn
+                # a healthy ingestion into a failed job.  The next run retries.
+                logger.exception("Failed to prune old ingestion generation", generation=generation)
+
     # ================================================================
     # Private methods — từng bước xử lý
     # ================================================================
@@ -265,6 +960,7 @@ class IngestionPipeline:
                         "file_name": rel,
                         # ID phải ổn định giữa máy/deploy, không dùng absolute path.
                         "source_path": rel,
+                        "source_uri": rel,
                     })
                 result[rel] = documents
             else:
@@ -297,6 +993,7 @@ class IngestionPipeline:
                     "dataset_id": dataset_id,
                     "file_name": file_name,
                     "source_path": file_name,
+                    "source_uri": file_name,
                 }),
             }))
 
@@ -436,6 +1133,7 @@ class IngestionPipeline:
                     "file_name": chunk.metadata.file_name,
                     "file_type": chunk.metadata.file_type,
                     "source_path": chunk.metadata.source_path,
+                    "source_uri": chunk.metadata.source_uri or chunk.metadata.source_path,
                     "dataset_id": chunk.metadata.dataset_id,
                     "section_title": chunk.metadata.section_title,
                     "page_number": chunk.metadata.page_number,   # ★ THÊM
@@ -460,6 +1158,7 @@ class IngestionPipeline:
                     "file_name": chunk.metadata.file_name,
                     "file_type": chunk.metadata.file_type,
                     "source_path": chunk.metadata.source_path,
+                    "source_uri": chunk.metadata.source_uri or chunk.metadata.source_path,
                     "dataset_id": chunk.metadata.dataset_id,
                     "section_title": chunk.metadata.section_title,
                     "page_number": chunk.metadata.page_number,   # ★ THÊM

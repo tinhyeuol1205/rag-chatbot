@@ -4,7 +4,7 @@ UV := $(shell command -v uv 2>/dev/null || echo /Users/binh.dv/.local/bin/uv)
 # Bắt uv sync đồng bộ vào đúng môi trường rag/ (thay vì tạo .venv mặc định)
 export UV_PROJECT_ENVIRONMENT := rag
 
-.PHONY: help install install-dev local-start local-stop ingest ingest-sync run-api run-ui evaluate test lint check clean
+.PHONY: help install install-dev local-start local-stop ingest ingest-sync ingest-load run-api run-ui evaluate test lint check clean
 
 help: ## Hiển thị danh sách lệnh
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -34,6 +34,9 @@ ingest: ## Ingest tất cả sample documents vào Qdrant
 
 ingest-sync: ## Đồng bộ Qdrant với source directory, gồm xóa file không còn trên disk
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m ingestion.main --sync
+
+ingest-load: ## Chạy load benchmark PR11 (DATA_DIR=/srv/corpus)
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/load_ingestion_pr11.py $(DATA_DIR)
 
 # ======================================
 # --------- Run Application -----------

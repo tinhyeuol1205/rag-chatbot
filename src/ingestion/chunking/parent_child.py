@@ -20,11 +20,13 @@ Tham khảo: rag_master.md — Module 2, mục 2.2, strategy #4
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core import get_logger
 from core.config import settings
-from ingestion.models import Chunk, DocumentMetadata, RawDocument
+from ingestion.models import Chunk, RawDocument
 
 logger = get_logger(__name__)
 
@@ -43,10 +45,18 @@ def parent_child_chunk(documents: list[RawDocument]) -> tuple[list[Chunk], list[
         - parent_chunks: lưu vào Qdrant payload-only collection
         - child_chunks: embed + lưu vào Qdrant vector collection
     """
-    if not documents:
-        return [], []
+    parents: list[Chunk] = []
+    children: list[Chunk] = []
+    for parent_batch, child_batch in iter_parent_child_chunks(documents):
+        parents.extend(parent_batch)
+        children.extend(child_batch)
+    return parents, children
 
-    # Splitters — tạo 1 lần, dùng cho mọi document
+
+def iter_parent_child_chunks(
+    documents: Iterable[RawDocument],
+) -> Iterator[tuple[list[Chunk], list[Chunk]]]:
+    """Yield chunks per source document/window instead of materializing a file."""
     parent_splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.PARENT_CHUNK_SIZE,       # 2000 chars
         chunk_overlap=settings.PARENT_CHUNK_OVERLAP,  # 200 chars overlap
@@ -58,12 +68,12 @@ def parent_child_chunk(documents: list[RawDocument]) -> tuple[list[Chunk], list[
         separators=["\n\n", "\n", ". ", " ", ""],
     )
 
-    parent_chunks: list[Chunk] = []
-    child_chunks: list[Chunk] = []
-
-    # ★ Chunk theo TỪNG document → giữ metadata của document đó
+    # Chunk theo từng document → metadata remains local to a page/section.
     for doc_idx, doc in enumerate(documents):
+        parent_chunks: list[Chunk] = []
+        child_chunks: list[Chunk] = []
         md = doc.metadata
+        anchor = md.structural_anchor or f"doc:{doc_idx}"
         for p_idx, parent_text in enumerate(parent_splitter.split_text(doc.content)):
             # section_title: ưu tiên cái parser trích được; chỉ fallback khi thiếu
             if md.section_title:
@@ -77,15 +87,8 @@ def parent_child_chunk(documents: list[RawDocument]) -> tuple[list[Chunk], list[
                 content=parent_text,
                 is_parent=True,
                 parent_id=None,  # Parent không có parent
-                position=f"{doc_idx}:{p_idx}",       # ★ chống collision (P2-5)
-                metadata=DocumentMetadata(
-                    file_name=md.file_name,
-                    file_type=md.file_type,
-                    page_number=md.page_number,      # ★ GIỮ
-                    section_title=title,             # ★ GIỮ
-                    source_path=md.source_path,
-                    dataset_id=md.dataset_id,
-                ),
+                position=f"{anchor}:{p_idx}",
+                metadata=md.model_copy(update={"section_title": title}),
             )
             parent_chunks.append(parent)
 
@@ -95,17 +98,10 @@ def parent_child_chunk(documents: list[RawDocument]) -> tuple[list[Chunk], list[
                         content=child_text,
                         is_parent=False,
                         parent_id=parent.chunk_id,   # ★ Link đến parent
-                        position=f"{doc_idx}:{p_idx}:{c_idx}",
+                        position=f"{anchor}:{p_idx}:{c_idx}",
                         metadata=parent.metadata.model_copy(),   # thừa hưởng metadata thật
                     )
                 )
 
-    logger.info(
-        "Parent-Child chunking done",
-        source_docs=len(documents),
-        parents=len(parent_chunks),
-        children=len(child_chunks),
-        avg_children_per_parent=round(len(child_chunks) / max(len(parent_chunks), 1), 1),
-    )
-
-    return parent_chunks, child_chunks
+        if parent_chunks or child_chunks:
+            yield parent_chunks, child_chunks

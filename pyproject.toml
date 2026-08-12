@@ -16,6 +16,7 @@ dependencies = [
     "google-genai==2.15.0",
 
     # Embeddings + Reranker (local)
+    "numpy>=1.24,<3",
     "sentence-transformers>=3.0,<6",
 
     # Vector Database
