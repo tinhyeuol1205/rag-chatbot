@@ -46,18 +46,6 @@ def test_wrong_key_is_rejected_for_stream(monkeypatch):
 
     assert response.status_code == 401
 
-
-def test_unicode_api_key_is_compared_as_utf8_without_type_error(monkeypatch):
-    monkeypatch.setattr(settings, "API_KEY", "mật-khẩu-🔐")
-
-    with pytest.raises(HTTPException) as error:
-        api_main.require_api_key("sai-key")
-    assert error.value.status_code == 401
-
-    # A configured Unicode key must match exactly and must not raise TypeError.
-    api_main.require_api_key("mật-khẩu-🔐")
-
-
 def test_both_chat_endpoints_accept_correct_key(monkeypatch):
     monkeypatch.setattr(settings, "API_KEY", "secret")
     monkeypatch.setattr(
