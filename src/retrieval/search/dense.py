@@ -19,6 +19,7 @@ from core import get_logger
 from core.config import settings
 from core.db import QdrantConnector
 from ingestion.embeddings import EmbeddingService
+from retrieval.scope import RetrievalScope, default_scope
 
 logger = get_logger(__name__)
 
@@ -30,7 +31,13 @@ class DenseSearcher:
         self.qdrant = QdrantConnector()
         self.embedder = EmbeddingService()
 
-    def search(self, query: str, top_k: int | None = None) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        top_k: int | None = None,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> list[dict]:
         """Search bằng query text.
 
         Args:
@@ -41,6 +48,7 @@ class DenseSearcher:
             List[dict] — mỗi dict có: chunk_id, content, score, metadata
         """
         top_k = top_k or settings.TOP_K
+        scope = scope or default_scope()
 
         # Embed query → vector
         query_vector = self.embedder.embed_single(query)
@@ -50,11 +58,18 @@ class DenseSearcher:
             collection_name=settings.CHILD_COLLECTION,
             query_vector=query_vector,
             limit=top_k,
+            query_filter=scope.qdrant_filter(),
         )
 
-        return self._format_results(results)
+        return self._format_results(results, scope=scope)
 
-    def search_by_vector(self, vector: list[float], top_k: int | None = None) -> list[dict]:
+    def search_by_vector(
+        self,
+        vector: list[float],
+        top_k: int | None = None,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> list[dict]:
         """Search bằng vector có sẵn (dùng cho HyDE — đã embed sẵn).
 
         Args:
@@ -62,27 +77,39 @@ class DenseSearcher:
             top_k: Số kết quả trả về
         """
         top_k = top_k or settings.TOP_K
+        scope = scope or default_scope()
 
         results = self.qdrant.search(
             collection_name=settings.CHILD_COLLECTION,
             query_vector=vector,
             limit=top_k,
+            query_filter=scope.qdrant_filter(),
         )
 
-        return self._format_results(results)
+        return self._format_results(results, scope=scope)
 
-    def _format_results(self, raw_results) -> list[dict]:
+    def _format_results(
+        self,
+        raw_results,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> list[dict]:
         """Chuyển Qdrant results → dạng dict chuẩn."""
+        scope = scope or default_scope()
         formatted = []
         for r in raw_results:
+            payload = r.payload or {}
+            if not scope.allows(payload.get("dataset_id")):
+                continue
             formatted.append({
                 "chunk_id": r.id,
-                "content": r.payload.get("content", ""),
+                "content": payload.get("content", ""),
                 "score": r.score,
-                "parent_id": r.payload.get("parent_id"),
-                "file_name": r.payload.get("file_name", ""),
-                "section_title": r.payload.get("section_title", ""),
-                "page_number": r.payload.get("page_number"),   # ★ THÊM
+                "parent_id": payload.get("parent_id"),
+                "file_name": payload.get("file_name", ""),
+                "section_title": payload.get("section_title", ""),
+                "page_number": payload.get("page_number"),
+                "dataset_id": payload.get("dataset_id"),
                 "source": "dense",  # Đánh dấu nguồn tìm kiếm
             })
         return formatted

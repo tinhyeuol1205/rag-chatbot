@@ -7,7 +7,9 @@ class _FakeQdrant:
     def __init__(self, store):
         self.store = store
 
-    def get_by_ids(self, collection_name, ids):
+    def get_by_ids(self, collection_name, ids, *, query_filter=None):
+        if query_filter is not None:
+            assert query_filter.must[0].key == "dataset_id"
         return [type("P", (), {"id": i, "payload": self.store[i]})()
                 for i in ids if i in self.store]
 
@@ -17,7 +19,8 @@ def test_missing_parent_falls_back_to_child():
     resolver = ParentResolver()
     resolver.qdrant = _FakeQdrant({})            # parent collection rỗng
     children = [{"chunk_id": "c1", "content": "child text",
-                 "parent_id": "p1", "file_name": "a.md"}]
+                 "parent_id": "p1", "file_name": "a.md",
+                 "dataset_id": "sample_docs"}]
     out = resolver.resolve(children)
     assert len(out) == 1                          # trước fix: len == 0
     assert out[0]["content"] == "child text"
@@ -25,10 +28,14 @@ def test_missing_parent_falls_back_to_child():
 
 def test_two_children_same_parent_dedupe():
     resolver = ParentResolver()
-    resolver.qdrant = _FakeQdrant({"p1": {"content": "parent text", "file_name": "a.md"}})
+    resolver.qdrant = _FakeQdrant({"p1": {
+        "content": "parent text", "file_name": "a.md", "dataset_id": "sample_docs",
+    }})
     children = [
-        {"chunk_id": "c1", "content": "x", "parent_id": "p1", "file_name": "a.md"},
-        {"chunk_id": "c2", "content": "y", "parent_id": "p1", "file_name": "a.md"},
+        {"chunk_id": "c1", "content": "x", "parent_id": "p1", "file_name": "a.md",
+         "dataset_id": "sample_docs"},
+        {"chunk_id": "c2", "content": "y", "parent_id": "p1", "file_name": "a.md",
+         "dataset_id": "sample_docs"},
     ]
     out = resolver.resolve(children)
     assert len(out) == 1
@@ -38,7 +45,8 @@ def test_two_children_same_parent_dedupe():
 def test_child_without_parent_id_kept():
     resolver = ParentResolver()
     resolver.qdrant = _FakeQdrant({})
-    children = [{"chunk_id": "c1", "content": "orphan", "parent_id": None}]
+    children = [{"chunk_id": "c1", "content": "orphan", "parent_id": None,
+                 "dataset_id": "sample_docs"}]
     out = resolver.resolve(children)
     assert len(out) == 1
     assert out[0]["content"] == "orphan"

@@ -1,5 +1,7 @@
 """Dataset-scoped directory sync tests."""
 
+import pytest
+
 from core.config import settings
 from ingestion.models import Chunk, DocumentMetadata, EmbeddedChunk, RawDocument
 from ingestion.pipeline import IngestionPipeline, IngestionResult, ParseBatch, PreparedFile
@@ -115,7 +117,7 @@ def test_sync_does_not_touch_other_dataset(tmp_path):
     qdrant.seed(settings.PARENT_COLLECTION, "hr-parent", dataset_id="hr_docs", file_name="policy.md")
     qdrant.seed(settings.CHILD_COLLECTION, "hr-child", dataset_id="hr_docs", file_name="policy.md")
     pipeline = _pipeline(qdrant)
-    pipeline._parse_all_files = lambda _path: ParseBatch()
+    pipeline._parse_all_files = lambda _path: ParseBatch(discovered_files={"keep.md"})
     source_dir = tmp_path / "empty"
     source_dir.mkdir()
 
@@ -163,9 +165,39 @@ def test_empty_directory_requires_explicit_sync_to_prune(tmp_path):
     assert no_sync_result.pruned_files == set()
     assert qdrant.deleted == []
 
-    sync_result = pipeline.run(str(source_dir), sync=True)
+    with pytest.raises(ValueError, match="empty source"):
+        pipeline.run(str(source_dir), sync=True)
+
+    sync_result = pipeline.run(str(source_dir), sync=True, allow_empty_source=True)
     assert sync_result.pruned_files == {"old.md"}
     assert {
         (settings.PARENT_COLLECTION, "old-parent"),
         (settings.CHILD_COLLECTION, "old-child"),
     } <= set(qdrant.deleted)
+
+
+def test_non_directory_source_is_rejected(tmp_path):
+    qdrant = _SyncQdrant()
+    pipeline = _pipeline(qdrant)
+    source_file = tmp_path / "not-a-directory.md"
+    source_file.write_text("content", encoding="utf-8")
+
+    with pytest.raises(NotADirectoryError, match="not a directory"):
+        pipeline.run(str(source_file), sync=True, allow_empty_source=True)
+
+
+def test_dry_run_reports_prune_without_mutating_qdrant(tmp_path):
+    qdrant = _SyncQdrant()
+    qdrant.seed(settings.PARENT_COLLECTION, "old-parent", dataset_id="sample_docs", file_name="old.md")
+    qdrant.seed(settings.CHILD_COLLECTION, "old-child", dataset_id="sample_docs", file_name="old.md")
+    pipeline = _pipeline(qdrant)
+    pipeline._parse_all_files = lambda _path: ParseBatch(discovered_files={"keep.md"})
+    source_dir = tmp_path / "docs"
+    source_dir.mkdir()
+
+    result = pipeline.run(str(source_dir), sync=True, dry_run=True)
+
+    assert result.dry_run is True
+    assert result.planned_pruned_files == {"old.md"}
+    assert result.pruned_files == set()
+    assert qdrant.deleted == []

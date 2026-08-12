@@ -65,6 +65,8 @@ class IngestionResult:
     failed_files: set[str] = field(default_factory=set)
     pruned_files: set[str] = field(default_factory=set)
     prune_skipped: bool = False
+    planned_pruned_files: set[str] = field(default_factory=set)
+    dry_run: bool = False
 
 
 class IngestionPipeline:
@@ -74,18 +76,65 @@ class IngestionPipeline:
         self.qdrant = QdrantConnector()
         self.embedder = EmbeddingService()
 
-    def run(self, data_dir: str, *, sync: bool = False) -> IngestionResult:
-        """Chạy pipeline safe-replace; chỉ prune file mất khi ``sync=True``."""
+    def run(
+        self,
+        data_dir: str,
+        *,
+        sync: bool = False,
+        allow_empty_source: bool = False,
+        dry_run: bool = False,
+    ) -> IngestionResult:
+        """Chạy pipeline safe-replace với guard cho destructive sync.
+
+        ``sync=True`` không được coi một source rỗng là trạng thái hợp lệ mặc
+        định: mount sai hoặc listing lỗi có thể nếu không sẽ xóa toàn dataset.
+        Caller phải truyền ``allow_empty_source=True`` một cách rõ ràng để prune
+        về zero. ``dry_run`` chỉ lập kế hoạch, không tạo collection hay mutate DB.
+        """
 
         data_path = Path(data_dir)
         if not data_path.exists():
             raise FileNotFoundError(f"Data directory not found: {data_dir}")
+        if not data_path.is_dir():
+            raise NotADirectoryError(f"Data path is not a directory: {data_dir}")
+
+        # Bước 1: Scan & parse, giữ discovered_files kể cả file parse lỗi.
+        parse_batch = self._parse_all_files(data_path)
+
+        if sync and not parse_batch.discovered_files and not allow_empty_source:
+            raise ValueError(
+                "Refusing destructive sync from an empty source. "
+                "Verify the mount/path, or pass allow_empty_source=True explicitly."
+            )
+
+        if dry_run:
+            planned_pruned_files = (
+                self._find_removed_files(
+                    settings.INGEST_DATASET_ID,
+                    parse_batch.discovered_files,
+                )
+                if sync and not parse_batch.failed_files
+                else set()
+            )
+            logger.info(
+                "Ingestion dry-run complete",
+                dataset_id=settings.INGEST_DATASET_ID,
+                discovered=len(parse_batch.discovered_files),
+                failed=len(parse_batch.failed_files),
+                would_prune=sorted(planned_pruned_files),
+            )
+            return IngestionResult(
+                dataset_id=settings.INGEST_DATASET_ID,
+                discovered_files=parse_batch.discovered_files,
+                failed_files=parse_batch.failed_files,
+                planned_pruned_files=planned_pruned_files,
+                prune_skipped=sync and bool(parse_batch.failed_files),
+                dry_run=True,
+            )
 
         # Bước 0: Tạo collections trong Qdrant
         self._init_collections()
 
-        # Bước 1: Scan & parse, giữ discovered_files kể cả file parse lỗi.
-        parse_batch = self._parse_all_files(data_path)
         processed_files: set[str] = set()
         pruned_files: set[str] = set()
         bm25_may_be_dirty = False
@@ -297,17 +346,7 @@ class IngestionPipeline:
         on_mutation: Callable[[], None] | None = None,
     ) -> set[str]:
         """Xóa file không còn trên disk, chỉ trong namespace dataset hiện tại."""
-        stored_files = (
-            self.qdrant.list_file_names_by_dataset(
-                settings.CHILD_COLLECTION,
-                dataset_id=dataset_id,
-            )
-            | self.qdrant.list_file_names_by_dataset(
-                settings.PARENT_COLLECTION,
-                dataset_id=dataset_id,
-            )
-        )
-        removed_files = stored_files - discovered_files
+        removed_files = self._find_removed_files(dataset_id, discovered_files)
         for file_name in sorted(removed_files):
             child_ids = self.qdrant.list_ids_by_source(
                 settings.CHILD_COLLECTION,
@@ -331,6 +370,24 @@ class IngestionPipeline:
         if removed_files:
             logger.info("Pruned removed files", dataset_id=dataset_id, files=sorted(removed_files))
         return removed_files
+
+    def _find_removed_files(
+        self,
+        dataset_id: str,
+        discovered_files: set[str],
+    ) -> set[str]:
+        """Return stale file names scoped to one dataset, without mutating Qdrant."""
+        stored_files = (
+            self.qdrant.list_file_names_by_dataset(
+                settings.CHILD_COLLECTION,
+                dataset_id=dataset_id,
+            )
+            | self.qdrant.list_file_names_by_dataset(
+                settings.PARENT_COLLECTION,
+                dataset_id=dataset_id,
+            )
+        )
+        return stored_files - discovered_files
 
     @staticmethod
     def _invalidate_bm25_index() -> None:

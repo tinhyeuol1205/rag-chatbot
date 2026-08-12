@@ -35,6 +35,7 @@ Luồng xử lý đầy đủ:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from unicodedata import normalize
 
 from core import get_logger
 from core.llm import get_llm_service
@@ -45,6 +46,7 @@ from retrieval.query_transform.condense import QueryCondenser
 from retrieval.query_transform.hyde import HyDEGenerator
 from retrieval.query_transform.multi_query import MultiQueryExpander
 from retrieval.reranking.cross_encoder import CrossEncoderReranker
+from retrieval.scope import RetrievalScope, default_scope
 from retrieval.search.hybrid import HybridSearcher, rrf_fusion
 
 logger = get_logger(__name__)
@@ -53,6 +55,26 @@ NO_CONTEXT_MSG = (
     "I don't have enough information in the company documents "
     "to answer this question."
 )
+
+
+def _normalize_query_key(query: str) -> str:
+    """Normalize query text for plan deduplication without changing search text."""
+    return " ".join(normalize("NFKC", query).casefold().split())
+
+
+def _dedupe_queries(queries: list[str]) -> list[str]:
+    """Keep the first spelling of each normalized query in deterministic order."""
+    seen: set[str] = set()
+    unique: list[str] = []
+    for query in queries:
+        if not isinstance(query, str):
+            continue
+        key = _normalize_query_key(query)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(query.strip())
+    return unique
 
 
 @dataclass
@@ -79,7 +101,10 @@ class RetrievalResult:
 class RAGRetriever:
     """Main orchestrator — kết nối tất cả components."""
 
-    def __init__(self):
+    def __init__(self, scope: RetrievalScope | None = None):
+        # Scope is constructed by the server/configuration boundary.  It is not
+        # read from ChatRequest, so a caller cannot switch datasets per request.
+        self.scope = scope or default_scope()
         self.expander = MultiQueryExpander()
         self.hyde = HyDEGenerator()
         self.searcher = HybridSearcher()
@@ -89,8 +114,11 @@ class RAGRetriever:
         self.llm = get_llm_service()
         self.condenser = QueryCondenser()
 
-    def retrieve(self, user_query: str, history: list[tuple[str, str]] | None = None
-                 ) -> RetrievalResult:
+    def retrieve(
+        self,
+        user_query: str,
+        history: list[tuple[str, str]] | None = None,
+    ) -> RetrievalResult:
         """Chạy retrieval và trả về context có cấu trúc.
 
         Tách riêng khỏi generate để evaluation lấy được context THẬT đã đưa vào LLM
@@ -110,14 +138,38 @@ class RAGRetriever:
             expanded_queries = f_expand.result()
             hyde_vector = f_hyde.result()
 
-        # ③ Hybrid Search — thu từng result_list RIÊNG BIỆT (không gộp chung)
-        # ★ Dùng search_query (đã condense) cho MỌI search — kể cả query đầu tiên
-        result_lists = [self.searcher.search(search_query, hyde_vector=hyde_vector)]
-        for eq in expanded_queries:
-            result_lists.append(self.searcher.search(eq))
+        # ③ Build a deterministic query plan.  MultiQueryExpander historically
+        # returned the original query as its first item; searching that list after
+        # the direct hybrid search double-counted the sparse signal in RRF.
+        unique_queries = _dedupe_queries([search_query, *expanded_queries])
+        variant_queries = unique_queries[1:]
+
+        # Direct channel: dense(query) + sparse(query), exactly once.
+        result_lists = [self.searcher.search(search_query, scope=self.scope)]
+        weights = [1.0]
+
+        # HyDE is a separate dense-only vote.  Its sparse side would be identical
+        # to the direct channel and must not be counted a second time.
+        if hyde_vector:
+            result_lists.append(
+                self.searcher.search(
+                    search_query,
+                    hyde_vector=hyde_vector,
+                    scope=self.scope,
+                    include_sparse=False,
+                )
+            )
+            weights.append(1.0)
+
+        # Each distinct expansion gets one normal hybrid vote.
+        for expanded_query in variant_queries:
+            result_lists.append(
+                self.searcher.search(expanded_query, scope=self.scope)
+            )
+            weights.append(1.0)
 
         # ④ RRF Fusion trên TẤT CẢ cùng lúc — điểm cộng dồn qua mọi query
-        unique = rrf_fusion(*result_lists)
+        unique = rrf_fusion(*result_lists, weights=weights)
         logger.info(
             "Fusion done",
             n_lists=len(result_lists),
@@ -130,14 +182,14 @@ class RAGRetriever:
         top_chunks = self.reranker.rerank(search_query, unique)
 
         # ⑥ Parent Resolution
-        resolved = self.parent_resolver.resolve(top_chunks)
+        resolved = self.parent_resolver.resolve(top_chunks, scope=self.scope)
 
         # ⑦ Context Assembly
         assembled = self.assembler.assemble(resolved)
 
         return RetrievalResult(
             assembled=assembled,
-            expanded_queries=expanded_queries,
+            expanded_queries=unique_queries,
             search_query=search_query,
             num_reranked_candidates=len(top_chunks),
         )

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from core import get_logger
 from core.config import settings
+from retrieval.scope import RetrievalScope, default_scope
 from retrieval.search.dense import DenseSearcher
 from retrieval.search.sparse import SparseSearcher
 
@@ -55,6 +56,9 @@ class HybridSearcher:
         query: str,
         top_k: int | None = None,
         hyde_vector: list[float] | None = None,
+        *,
+        scope: RetrievalScope | None = None,
+        include_sparse: bool = True,
     ) -> list[dict]:
         """Hybrid search: Dense + Sparse + RRF fusion.
 
@@ -67,17 +71,26 @@ class HybridSearcher:
             List[dict] đã merge và rank bằng RRF
         """
         top_k = top_k or settings.TOP_K
+        scope = scope or default_scope()
 
         # --- Bước 1: Chạy song song 2 search engines ---
 
         # Dense: dùng HyDE vector nếu có, nếu không thì embed query
         if hyde_vector:
-            dense_results = self.dense.search_by_vector(hyde_vector, top_k=top_k)
+            dense_results = self.dense.search_by_vector(
+                hyde_vector,
+                top_k=top_k,
+                scope=scope,
+            )
         else:
-            dense_results = self.dense.search(query, top_k=top_k)
+            dense_results = self.dense.search(query, top_k=top_k, scope=scope)
 
         # Sparse: BM25 keyword search
-        sparse_results = self.sparse.search(query, top_k=top_k)
+        sparse_results = (
+            self.sparse.search(query, top_k=top_k, scope=scope)
+            if include_sparse
+            else []
+        )
 
         # --- Bước 2: RRF Fusion ---
         merged = self._rrf_fusion(dense_results, sparse_results)
