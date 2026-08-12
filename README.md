@@ -156,8 +156,12 @@ curl -X POST http://127.0.0.1:8080/chat \
 ### Ingestion sync
 
 `make ingest-sync` đồng bộ Qdrant với source directory — file bị xoá khỏi thư mục
-cũng được xoá khỏi DB, scoped theo `INGEST_DATASET_ID`. Sau khi ingest ở terminal
-khác, restart server để BM25 index rebuild (xem Limitations).
+cũng được xoá khỏi DB, scoped theo `INGEST_DATASET_ID`. Lệnh từ chối source rỗng
+theo mặc định để tránh xóa nhầm khi volume mount sai; chỉ dùng
+`python -m ingestion.main --sync --allow-empty-source` khi đã xác minh nguồn.
+Dùng `--dry-run` để xem kế hoạch trước khi mutate. Ingestion có file lỗi sẽ ghi
+summary JSON và trả exit code khác 0 để scheduler/CI không đánh dấu job thành công.
+Sau khi ingest ở terminal khác, restart server để BM25 index rebuild (xem Limitations).
 
 Sau khi nâng cấp từ dữ liệu trước PR 8, cần đặt `INGEST_DATASET_ID` rồi chạy full
 `make ingest` một lần để tạo payload/IDs mới. Legacy points thiếu `dataset_id` không

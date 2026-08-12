@@ -32,13 +32,15 @@ from core import get_logger
 from core.config import settings
 from core.db import QdrantConnector
 from core.errors import RetrievalError
+from retrieval.scope import RetrievalScope, default_scope
 
 logger = get_logger(__name__)
 
-# Index được chia sẻ ở module level: tạo bao nhiêu instance cũng chỉ build 1 lần.
-# Gọi invalidate_bm25_index() sau khi ingest để nạp lại (bug P1-9a).
+# Index được chia sẻ ở module level: tạo bao nhiêu instance cũng chỉ build 1 lần
+# cho mỗi authorized scope.  Gọi invalidate_bm25_index() sau khi ingest để nạp lại.
 _index_lock = Lock()
-_shared: dict = {"index": None, "documents": None, "version": 0}
+_index_cache: dict[tuple[str, ...], tuple[BM25Okapi | None, list[dict]]] = {}
+_index_version = 0
 
 # Tokenizer giữ được mã kiểu 'TC-456' kể cả khi dính dấu câu:
 #   "see TC-456."    → ['tc-456']
@@ -58,11 +60,11 @@ def invalidate_bm25_index() -> None:
     Lưu ý: chỉ có tác dụng trong CÙNG process. Nếu ingest ở terminal khác với
     server đang chạy → vẫn phải restart server để BM25 thấy dữ liệu mới.
     """
+    global _index_version
     with _index_lock:
-        _shared["index"] = None
-        _shared["documents"] = None
-        _shared["version"] += 1
-    logger.info("BM25 index invalidated", version=_shared["version"])
+        _index_cache.clear()
+        _index_version += 1
+    logger.info("BM25 index invalidated", version=_index_version)
 
 
 class SparseSearcher:
@@ -75,7 +77,13 @@ class SparseSearcher:
     def __init__(self):
         self.qdrant = QdrantConnector()
 
-    def search(self, query: str, top_k: int | None = None) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        top_k: int | None = None,
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> list[dict]:
         """Search bằng BM25 keyword matching.
 
         Lần đầu gọi sẽ build index (load tất cả docs từ Qdrant).
@@ -89,8 +97,9 @@ class SparseSearcher:
             List[dict] — mỗi dict có: chunk_id, content, score, metadata
         """
         top_k = top_k or settings.TOP_K
+        scope = scope or default_scope()
 
-        index, documents = self._ensure_index()
+        index, documents = self._ensure_index(scope)
         if not documents or index is None:
             return []
 
@@ -120,20 +129,26 @@ class SparseSearcher:
                 "file_name": doc.get("file_name", ""),
                 "section_title": doc.get("section_title", ""),
                 "page_number": doc.get("page_number"),
+                "dataset_id": doc.get("dataset_id"),
                 "source": "sparse",  # Đánh dấu nguồn
             })
 
         logger.info("BM25 search done", query=query[:50], results=len(results))
         return results
 
-    def _ensure_index(self):
+    def _ensure_index(self, scope: RetrievalScope):
         """Lấy index dùng chung, build nếu chưa có (thread-safe)."""
         with _index_lock:
-            if _shared["index"] is None and _shared["documents"] is None:
-                self._build_index_locked()
-            return _shared["index"], _shared["documents"] or []
+            cached = _index_cache.get(scope.cache_key)
+            if cached is None:
+                cached = self._build_index_locked(scope)
+                _index_cache[scope.cache_key] = cached
+            return cached
 
-    def _build_index_locked(self) -> None:
+    def _build_index_locked(
+        self,
+        scope: RetrievalScope,
+    ) -> tuple[BM25Okapi | None, list[dict]]:
         """Load tất cả documents từ Qdrant → build BM25 index.
 
         Gọi 1 lần duy nhất (đã nằm trong lock), kết quả cached cho các query sau.
@@ -142,7 +157,10 @@ class SparseSearcher:
 
         # Đọc tất cả child chunks từ Qdrant
         try:
-            points = self.qdrant.scroll_all(settings.CHILD_COLLECTION)
+            points = self.qdrant.scroll_all(
+                settings.CHILD_COLLECTION,
+                scroll_filter=scope.qdrant_filter(),
+            )
         except Exception as exc:
             # Chi tiết SDK chỉ nằm trong traceback server-side; public layer
             # dùng RetrievalError.public_message để tránh leak hạ tầng.
@@ -158,6 +176,8 @@ class SparseSearcher:
 
         for point in points:
             payload = point.payload or {}
+            if not scope.allows(payload.get("dataset_id")):
+                continue
             content = payload.get("content", "")
             if not content:
                 continue
@@ -168,10 +188,10 @@ class SparseSearcher:
                 "file_name": payload.get("file_name", ""),
                 "section_title": payload.get("section_title", ""),
                 "page_number": payload.get("page_number"),
+                "dataset_id": payload.get("dataset_id"),
             })
             # Tokenize: giữ mã hiệu dính dấu câu
             corpus.append(tokenize(content))
 
-        _shared["documents"] = documents
-        _shared["index"] = BM25Okapi(corpus) if corpus else None
         logger.info("BM25 index built", total_documents=len(documents))
+        return BM25Okapi(corpus) if corpus else None, documents

@@ -44,7 +44,6 @@ def test_wrong_key_is_rejected_for_stream(monkeypatch):
 
     assert response.status_code == 401
 
-
 def test_both_chat_endpoints_accept_correct_key(monkeypatch):
     monkeypatch.setattr(settings, "API_KEY", "secret")
     monkeypatch.setattr(
@@ -87,3 +86,15 @@ def test_dev_mode_keeps_auth_disabled(monkeypatch):
 
     response = client.post("/chat", json={"query": "q"})
     assert response.status_code == 200
+
+
+def test_request_cannot_select_an_arbitrary_dataset(monkeypatch):
+    monkeypatch.setattr(settings, "API_KEY", "")
+    client = TestClient(api_main.app)
+
+    response = client.post(
+        "/chat",
+        json={"query": "q", "dataset_id": "another_team"},
+    )
+
+    assert response.status_code == 422

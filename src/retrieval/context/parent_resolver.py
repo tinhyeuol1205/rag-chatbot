@@ -17,6 +17,7 @@ from __future__ import annotations
 from core import get_logger
 from core.config import settings
 from core.db import QdrantConnector
+from retrieval.scope import RetrievalScope, default_scope
 
 logger = get_logger(__name__)
 
@@ -27,7 +28,12 @@ class ParentResolver:
     def __init__(self):
         self.qdrant = QdrantConnector()
 
-    def resolve(self, child_results: list[dict]) -> list[dict]:
+    def resolve(
+        self,
+        child_results: list[dict],
+        *,
+        scope: RetrievalScope | None = None,
+    ) -> list[dict]:
         """Thay thế child chunks bằng parent chunks.
 
         Args:
@@ -37,6 +43,23 @@ class ParentResolver:
             List[dict] với content được thay bằng parent chunk content.
             Deduplicate: nếu 2 children cùng 1 parent → chỉ giữ 1 parent.
         """
+        if not child_results:
+            return []
+
+        scope = scope or default_scope()
+        # Do not trust callers/search plugins to have applied the same filter.
+        # Missing dataset_id is a legacy point and is intentionally rejected.
+        scoped_children = [
+            doc for doc in child_results if scope.allows(doc.get("dataset_id"))
+        ]
+        if len(scoped_children) != len(child_results):
+            logger.warning(
+                "Dropped child results outside retrieval scope",
+                input_count=len(child_results),
+                kept_count=len(scoped_children),
+                datasets=scope.dataset_ids,
+            )
+        child_results = scoped_children
         if not child_results:
             return []
 
@@ -53,13 +76,18 @@ class ParentResolver:
             return child_results
 
         # Lấy parent chunks từ Qdrant
-        parent_points = self.qdrant.get_by_ids(settings.PARENT_COLLECTION, parent_ids)
+        parent_points = self.qdrant.get_by_ids(
+            settings.PARENT_COLLECTION,
+            parent_ids,
+            query_filter=scope.qdrant_filter(),
+        )
 
         # Tạo lookup: parent_id → parent content
         # Cả 2 phía đều là UUID canonical (PR 3 / P2-5) → không cần normalize dấu '-'
         parent_map = {
             str(point.id): point.payload
             for point in parent_points
+            if point.payload and scope.allows(point.payload.get("dataset_id"))
         }
 
         # Thay child content bằng parent content
@@ -98,6 +126,7 @@ class ParentResolver:
                 "file_name": parent_payload.get("file_name") or doc.get("file_name", ""),
                 "section_title": parent_payload.get("section_title") or doc.get("section_title", ""),
                 "page_number": parent_payload.get("page_number") or doc.get("page_number"),
+                "dataset_id": parent_payload.get("dataset_id"),
                 "is_parent": True,
             })
 

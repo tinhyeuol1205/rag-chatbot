@@ -26,6 +26,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     FilterSelector,
+    HasIdCondition,
     MatchValue,
     PointIdsList,
     PointStruct,
@@ -188,20 +189,52 @@ class QdrantConnector:
         )
         logger.info("Deleted points by IDs", collection=collection_name, count=len(ids))
 
-    def delete_by_file_name(self, collection_name: str, file_name: str) -> None:
-        """Xoá mọi point của 1 file — gọi TRƯỚC khi ingest lại file đó.
+    def delete_by_file_name(
+        self,
+        collection_name: str,
+        file_name: str,
+        *,
+        dataset_id: str | None = None,
+    ) -> None:
+        """Xoá mọi point của 1 file trong một dataset namespace.
 
         Chống chunk rác vĩnh viễn (bug P1-6): content đổi → chunk_id đổi →
         point cũ không ai xoá. Fix: xoá toàn bộ point theo file_name trước khi
         ghi lại file.
         """
+        if dataset_id is None:
+            raise ValueError(
+                "dataset_id is required; an unscoped file delete could affect another dataset"
+            )
+        self.delete_by_file_name_scoped(
+            collection_name,
+            file_name,
+            dataset_id=dataset_id,
+        )
+
+    def delete_by_file_name_scoped(
+        self,
+        collection_name: str,
+        file_name: str,
+        *,
+        dataset_id: str,
+    ) -> None:
+        """Delete one file without crossing dataset boundaries.
+
+        The old unscoped helper is intentionally disabled.  Keeping an unscoped
+        delete available is too easy to misuse when multiple datasets share a
+        collection.
+        """
+        if not dataset_id:
+            raise ValueError("dataset_id is required for a scoped delete")
         if not self._collection_exists(collection_name):
             return
         self.client.delete(
             collection_name=collection_name,
             points_selector=FilterSelector(
                 filter=Filter(must=[
-                    FieldCondition(key="file_name", match=MatchValue(value=file_name))
+                    FieldCondition(key="dataset_id", match=MatchValue(value=dataset_id)),
+                    FieldCondition(key="file_name", match=MatchValue(value=file_name)),
                 ])
             ),
             wait=True,
@@ -239,6 +272,7 @@ class QdrantConnector:
         collection_name: str,
         query_vector: list[float],
         limit: int = 10,
+        query_filter: Filter | None = None,
     ) -> list:
         """Tìm kiếm vector tương đồng (cosine similarity).
 
@@ -248,11 +282,17 @@ class QdrantConnector:
             collection_name=collection_name,
             query=query_vector,
             limit=limit,
+            query_filter=query_filter,
         )
         return result.points
 
-    def scroll_all(self, collection_name: str, batch_size: int = 1000,
-                   max_points: int | None = None) -> list:
+    def scroll_all(
+        self,
+        collection_name: str,
+        batch_size: int = 1000,
+        max_points: int | None = None,
+        scroll_filter: Filter | None = None,
+    ) -> list:
         """Đọc TẤT CẢ points trong collection (phân trang đúng cách).
 
         Fix bug P1-9: bản cũ chỉ đọc trang đầu (limit=10000) → mọi point sau
@@ -262,6 +302,7 @@ class QdrantConnector:
         while True:
             points, offset = self.client.scroll(
                 collection_name=collection_name,
+                scroll_filter=scroll_filter,
                 limit=batch_size,
                 offset=offset,
                 with_payload=True,
@@ -278,8 +319,34 @@ class QdrantConnector:
         logger.info("Scrolled collection", collection=collection_name, total=len(all_points))
         return all_points
 
-    def get_by_ids(self, collection_name: str, ids: list[str]) -> list:
-        """Lấy points theo danh sách IDs (dùng retrieve tiêu chuẩn)."""
+    def get_by_ids(
+        self,
+        collection_name: str,
+        ids: list[str],
+        *,
+        query_filter: Filter | None = None,
+    ) -> list:
+        """Lấy points theo IDs, tùy chọn kết hợp filter server-side.
+
+        Qdrant ``retrieve`` không hỗ trợ payload filters.  Khi scope được truyền,
+        dùng ``scroll`` với ``HasIdCondition`` để không fetch parent ngoài scope.
+        """
+        if query_filter is not None:
+            scoped_filter = Filter(must=[query_filter, HasIdCondition(has_id=ids)])
+            points, offset = [], None
+            while True:
+                batch, offset = self.client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=scoped_filter,
+                    limit=max(len(ids), 1),
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                points.extend(batch)
+                if offset is None:
+                    break
+            return points
         return self.client.retrieve(
             collection_name=collection_name,
             ids=ids,
