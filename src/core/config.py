@@ -44,6 +44,38 @@ class Settings(BaseSettings):
             raise ConfigurationError("LLM_PROVIDER=openai nhưng thiếu OPENAI_API_KEY.")
         if provider == "gemini" and not self.GEMINI_API_KEY:
             raise ConfigurationError("LLM_PROVIDER=gemini nhưng thiếu GEMINI_API_KEY.")
+        positive_limits = {
+            "INGEST_EMBED_BATCH_SIZE": self.INGEST_EMBED_BATCH_SIZE,
+            "INGEST_DOCUMENT_WINDOW": self.INGEST_DOCUMENT_WINDOW,
+            "INGEST_QDRANT_WRITE_BATCH_SIZE": self.INGEST_QDRANT_WRITE_BATCH_SIZE,
+            "INGEST_QDRANT_WRITE_MAX_BYTES": self.INGEST_QDRANT_WRITE_MAX_BYTES,
+            "INGEST_QDRANT_MAX_RETRIES": self.INGEST_QDRANT_MAX_RETRIES,
+            "INGEST_GENERATION_RETENTION": self.INGEST_GENERATION_RETENTION,
+            "INGEST_MAX_MEMORY_MB": self.INGEST_MAX_MEMORY_MB,
+        }
+        invalid = [name for name, value in positive_limits.items() if value <= 0]
+        if invalid:
+            raise ConfigurationError(f"Ingestion limits must be positive: {invalid}")
+        retry_delays = {
+            "INGEST_RETRY_BASE_SECONDS": self.INGEST_RETRY_BASE_SECONDS,
+            "INGEST_RETRY_MAX_SECONDS": self.INGEST_RETRY_MAX_SECONDS,
+        }
+        invalid_delays = [name for name, value in retry_delays.items() if value <= 0]
+        if self.INGEST_RETRY_MAX_SECONDS < self.INGEST_RETRY_BASE_SECONDS:
+            invalid_delays.append("INGEST_RETRY_MAX_SECONDS")
+        if invalid_delays:
+            raise ConfigurationError(
+                "Ingestion retry delays must be positive and max >= base: "
+                f"{invalid_delays}"
+            )
+        ratios = {
+            "INGEST_PARSER_MAX_EMPTY_PAGE_RATIO": self.INGEST_PARSER_MAX_EMPTY_PAGE_RATIO,
+            "INGEST_PARSER_MAX_UNSUPPORTED_RATIO": self.INGEST_PARSER_MAX_UNSUPPORTED_RATIO,
+            "INGEST_PARSER_MAX_REPLACEMENT_RATIO": self.INGEST_PARSER_MAX_REPLACEMENT_RATIO,
+        }
+        invalid_ratios = [name for name, value in ratios.items() if not 0 <= value <= 1]
+        if invalid_ratios:
+            raise ConfigurationError(f"Ingestion quality ratios must be between 0 and 1: {invalid_ratios}")
         return self
 
     # --- LLM Provider (chọn "openai" hoặc "gemini") ---
@@ -93,8 +125,38 @@ class Settings(BaseSettings):
     PARENT_CHUNK_OVERLAP: int = 200
 
     # --- Collection Names (Qdrant) ---
-    CHILD_COLLECTION: str = "child_chunks"
-    PARENT_COLLECTION: str = "parent_chunks"
+    # Stable aliases used by retrieval.  Concrete generation collections are
+    # created by the versioned ingestion pipeline and switched atomically to
+    # these names.  The old names remain configurable for migration tooling.
+    CHILD_COLLECTION: str = "child_chunks_active"
+    PARENT_COLLECTION: str = "parent_chunks_active"
+    LEGACY_CHILD_COLLECTION: str = "child_chunks"
+    LEGACY_PARENT_COLLECTION: str = "parent_chunks"
+
+    # --- Versioned ingestion ---
+    INGEST_VERSIONED: bool = True
+    INGEST_MANIFEST_PATH: str = "data/ingest_runs/manifest.sqlite3"
+    INGEST_PIPELINE_VERSION: str = "11.0"
+    INGEST_SCHEMA_VERSION: str = "1"
+    INGEST_PARSER_VERSION: str = "2"
+    INGEST_CHUNKER_VERSION: str = "2"
+    INGEST_EMBEDDING_MODEL_REVISION: str = ""
+    INGEST_EMBED_BATCH_SIZE: int = 32
+    INGEST_DOCUMENT_WINDOW: int = 8
+    INGEST_QDRANT_WRITE_BATCH_SIZE: int = 256
+    INGEST_QDRANT_WRITE_MAX_BYTES: int = 4_000_000
+    INGEST_QDRANT_MAX_RETRIES: int = 5
+    INGEST_RETRY_BASE_SECONDS: float = 0.25
+    INGEST_RETRY_MAX_SECONDS: float = 8.0
+    INGEST_GENERATION_RETENTION: int = 2
+    INGEST_MAX_MEMORY_MB: int = 2048
+    INGEST_PARSER_MAX_EMPTY_PAGE_RATIO: float = 0.5
+    INGEST_PARSER_MAX_UNSUPPORTED_RATIO: float = 0.5
+    INGEST_PARSER_MIN_TEXT_CHARS: int = 8
+    INGEST_PARSER_MAX_REPLACEMENT_RATIO: float = 0.02
+    INGEST_FAIL_ON_QUALITY: bool = True
+    INGEST_PDF_FAST_STRATEGY: str = "fast"
+    INGEST_PDF_OCR_STRATEGY: str = "hi_res"
 
     # --- Ingestion namespace ---
     # Dùng để sync đúng dataset, không đụng points của source directory khác.

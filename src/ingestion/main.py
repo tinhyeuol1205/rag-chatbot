@@ -5,6 +5,7 @@ Chạy bằng: make ingest
 Hoặc:      cd src && python -m ingestion.main
 Đồng bộ xóa file cũ: python -m ingestion.main --sync
 Xem trước thay đổi:  python -m ingestion.main --sync --dry-run
+Resume job:           python -m ingestion.main --job-id <id>
 """
 
 from __future__ import annotations
@@ -34,6 +35,10 @@ def _result_payload(result: IngestionResult) -> dict:
         "planned_pruned_files": sorted(result.planned_pruned_files),
         "prune_skipped": result.prune_skipped,
         "dry_run": result.dry_run,
+        "job_id": result.job_id,
+        "generation_id": result.generation_id,
+        "skipped_files": sorted(result.skipped_files),
+        "quality_by_file": result.quality_by_file,
     }
 
 
@@ -84,6 +89,13 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_SUMMARY_PATH,
         help=f"JSON operator summary path (default: {DEFAULT_SUMMARY_PATH})",
     )
+    parser.add_argument("--job-id", default=None, help="Resume or label an ingestion job")
+    parser.add_argument("--generation-id", default=None, help="Use an explicit staging generation")
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Reject an existing job ID instead of resuming its checkpoints",
+    )
     args = parser.parse_args(argv)
 
     logger.info(
@@ -95,12 +107,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         pipeline = IngestionPipeline()
-        result = pipeline.run(
-            args.data_dir,
-            sync=args.sync,
-            allow_empty_source=args.allow_empty_source,
-            dry_run=args.dry_run,
-        )
+        pipeline_kwargs = {
+            "sync": args.sync,
+            "allow_empty_source": args.allow_empty_source,
+            "dry_run": args.dry_run,
+        }
+        if args.job_id is not None:
+            pipeline_kwargs["job_id"] = args.job_id
+        if args.generation_id is not None:
+            pipeline_kwargs["generation_id"] = args.generation_id
+        if args.no_resume:
+            pipeline_kwargs["resume"] = False
+        result = pipeline.run(args.data_dir, **pipeline_kwargs)
     except Exception as exc:
         logger.exception("Ingestion pipeline failed")
         try:
@@ -126,6 +144,8 @@ def main(argv: list[str] | None = None) -> int:
         failed=len(result.failed_files),
         pruned=len(result.pruned_files),
         planned_pruned=len(result.planned_pruned_files),
+        skipped=len(result.skipped_files),
+        generation_id=result.generation_id,
         summary_path=args.summary_path,
     )
     return 1 if result.failed_files else 0
