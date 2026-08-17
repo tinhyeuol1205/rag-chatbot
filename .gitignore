@@ -63,3 +63,6 @@ review/
 # Data (chứa các file dữ liệu, không cần push)
 # ============================================
 data/
+
+# Local manifests and dry-run output
+tmp/

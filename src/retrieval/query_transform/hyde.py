@@ -52,7 +52,7 @@ class HyDEGenerator:
             query: Câu hỏi của user
 
         Returns:
-            Vector 384d (embed từ hypothetical answer, KHÔNG phải từ query),
+            Vector 1024d (embed từ hypothetical answer, KHÔNG phải từ query),
             hoặc None nếu HyDE fail → caller sẽ dùng dense search thường.
         """
         # Bước 1: LLM sinh câu trả lời giả
@@ -82,4 +82,3 @@ class HyDEGenerator:
             temperature=0.5,  # Không quá creative, giữ sát chủ đề
             max_tokens=200,
         )
-

@@ -5,7 +5,7 @@ Luồng xử lý:
   1. Scan thư mục → tìm tất cả files (PDF, MD, DOCX)
   2. Parse mỗi file → list[RawDocument]
   3. Parent-Child Chunking → parent_chunks + child_chunks
-  4. Embed child chunks → vectors 384d
+  4. Embed child chunks → vectors 1024d (BGE-M3 default)
   5. Store vào Qdrant:
      - child_chunks → collection có vectors (dùng để search)
      - parent_chunks → collection payload-only (dùng để trả context)
@@ -19,6 +19,7 @@ Usage:
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ from ingestion.embeddings import EmbeddingService
 from ingestion.manifest import ManifestStore, pipeline_fingerprint, sha256_file
 from ingestion.models import Chunk, EmbeddedChunk, ParseQuality, RawDocument
 from ingestion.parsers import ParserDispatcher
+from retrieval.search.sparse import sparse_document
 
 logger = get_logger(__name__)
 
@@ -273,12 +275,27 @@ class IngestionPipeline:
 
         existing_job = self.manifest.get_job(job_id) if job_id else None
         if existing_job and resume:
+            if existing_job["status"] == "committed":
+                raise ValueError(
+                    "Committed ingestion generations are immutable; start a new job/generation"
+                )
+            if generation_id and generation_id != existing_job["generation_id"]:
+                raise ValueError("resume generation_id does not match the existing job")
             generation_id = generation_id or existing_job["generation_id"]
         else:
             generation_id = generation_id or uuid.uuid4().hex[:16]
         job_id = job_id or uuid.uuid4().hex
+        if self.manifest.is_generation_committed(settings.INGEST_DATASET_ID, generation_id):
+            raise ValueError(
+                "Committed ingestion generations are immutable; start a new generation"
+            )
         vector_dimension = self.embedder.dimension
         fingerprint = pipeline_fingerprint(embedding_dimension=vector_dimension)
+        self._recover_alias_activation(fingerprint=fingerprint, vector_dimension=vector_dimension)
+        if self.manifest.is_generation_committed(settings.INGEST_DATASET_ID, generation_id):
+            raise ValueError(
+                "Committed ingestion generations are immutable; start a new generation"
+            )
         active_sources = self.manifest.list_sources(settings.INGEST_DATASET_ID)
         previous_generation = next(
             (
@@ -408,10 +425,31 @@ class IngestionPipeline:
                 try:
                     parser = ParserDispatcher.get_parser(source["path"])
                     documents, quality = parser.parse_with_quality(source["path"])
+                    self._enforce_source_memory_budget(source_uri, documents)
                     quality_by_file[source_uri] = quality.as_dict()
                     if not self._quality_acceptable(quality, documents):
                         raise ValueError("parser_quality_threshold_exceeded")
                     documents = [self._normalize_document(document, source_uri, content_hash) for document in documents]
+                    # A retry with the same generation may have left points from
+                    # an older file revision. Remove only this staging source;
+                    # immutable active generations are never mutated.
+                    delete_source = getattr(self.qdrant, "delete_by_file_name_scoped", None)
+                    if delete_source is not None:
+                        delete_source(
+                            child_collection,
+                            source_uri,
+                            dataset_id=settings.INGEST_DATASET_ID,
+                        )
+                        delete_source(
+                            parent_collection,
+                            source_uri,
+                            dataset_id=settings.INGEST_DATASET_ID,
+                        )
+                    self.manifest.clear_source_checkpoints(
+                        dataset_id=settings.INGEST_DATASET_ID,
+                        generation_id=generation_id,
+                        source_uri=source_uri,
+                    )
                     parent_count, child_count = self._ingest_source(
                         documents,
                         source_uri=source_uri,
@@ -453,6 +491,17 @@ class IngestionPipeline:
                 for record in previous_records:
                     if record.source_uri in discovered:
                         continue
+                    if record.fingerprint != fingerprint:
+                        raise ValueError(
+                            "Cannot carry a source across ingestion schemas: "
+                            f"{record.source_uri}. Run a full --sync backfill with "
+                            "the complete corpus."
+                        )
+                    self.manifest.stage_active_source(
+                        dataset_id=settings.INGEST_DATASET_ID,
+                        source_uri=record.source_uri,
+                        generation_id=generation_id,
+                    )
                     copied_children = self.qdrant.copy_source_points(
                         previous_child,
                         child_collection,
@@ -621,6 +670,85 @@ class IngestionPipeline:
             generation_id=generation_id,
         )
 
+    def _recover_alias_activation(self, *, fingerprint: str, vector_dimension: int) -> None:
+        """Finish manifest activation after a crash between alias switch and commit.
+
+        Alias updates are atomic in Qdrant, while the SQLite promotion follows
+        them.  If the worker dies in that small gap, the next ingestion worker
+        can safely reconcile only a generation whose job is still ``running``
+        and whose source rows all carry committed working metadata.
+        """
+        try:
+            child = self.qdrant.alias_target(settings.CHILD_COLLECTION)
+            parent = self.qdrant.alias_target(settings.PARENT_COLLECTION)
+        except AttributeError:
+            return
+        if not child or not parent:
+            return
+        child_prefix = f"{settings.CHILD_COLLECTION}__"
+        parent_prefix = f"{settings.PARENT_COLLECTION}__"
+        if not child.startswith(child_prefix) or not parent.startswith(parent_prefix):
+            return
+        child_generation = child[len(child_prefix):]
+        parent_generation = parent[len(parent_prefix):]
+        if not child_generation or child_generation != parent_generation:
+            return
+        job = self.manifest.get_job_for_generation(
+            settings.INGEST_DATASET_ID,
+            child_generation,
+        )
+        if not job or job["status"] != "running":
+            return
+        records = self.manifest.list_sources(settings.INGEST_DATASET_ID)
+        working = {
+            record.source_uri
+            for record in records
+            if record.working_generation == child_generation
+            and record.working_status == "committed"
+        }
+        if not working:
+            return
+        # Confirm the aliased generation still has the expected native sparse schema
+        # before making its metadata visible.
+        self.qdrant.validate_collection_schema(
+            child,
+            schema_fingerprint=fingerprint,
+            vector_dimension=vector_dimension,
+            expected_distance=Distance.COSINE,
+            require_sparse=True,
+        )
+        self.qdrant.validate_collection_schema(
+            parent,
+            schema_fingerprint=fingerprint,
+            vector_dimension=None,
+            expected_distance=None,
+        )
+        self.manifest.activate_generation(
+            dataset_id=settings.INGEST_DATASET_ID,
+            generation_id=child_generation,
+            source_uris=working,
+        )
+        stale = {
+            record.source_uri
+            for record in records
+            if record.active_generation and record.source_uri not in working
+        }
+        self.manifest.mark_removed(
+            dataset_id=settings.INGEST_DATASET_ID,
+            source_uris=stale,
+        )
+        self.manifest.finish_job(
+            job_id=job["job_id"],
+            status="committed",
+            active_generation_after=child_generation,
+            summary={"recovered_after_alias_switch": True, "generation_id": child_generation},
+        )
+        logger.warning(
+            "Recovered manifest after alias switch",
+            generation=child_generation,
+            source_count=len(working),
+        )
+
     def _iter_source_files(self, data_path: Path) -> Iterator[dict]:
         supported = set(ParserDispatcher.supported_extensions())
         for path in data_path.rglob("*"):
@@ -662,6 +790,36 @@ class IngestionPipeline:
             return False
         replacement_ratio = quality.replacement_characters / max(quality.characters_emitted, 1)
         return replacement_ratio <= settings.INGEST_PARSER_MAX_REPLACEMENT_RATIO
+
+    @staticmethod
+    def _enforce_source_memory_budget(
+        source_uri: str,
+        documents: list[RawDocument],
+    ) -> None:
+        """Fail closed when one parsed source is too large for safe staging.
+
+        Parser libraries may materialize an entire PDF/DOCX before returning;
+        this estimate cannot undo that allocation, but it prevents the rest of
+        the pipeline from retaining another unbounded copy and makes the
+        configured limit observable.  Truly huge files should be split or sent
+        through a page-window parser worker.
+        """
+        estimated_bytes = sum(
+            len(document.content.encode("utf-8")) * 2 + 1024
+            for document in documents
+        )
+        limit = settings.INGEST_MAX_MEMORY_MB * 1024 * 1024
+        if estimated_bytes > limit:
+            raise MemoryError(
+                f"source {source_uri} exceeds ingestion memory budget: "
+                f"estimated={estimated_bytes} limit={limit}"
+            )
+        logger.info(
+            "Parsed source memory estimate",
+            source=source_uri,
+            estimated_bytes=estimated_bytes,
+            memory_budget_bytes=limit,
+        )
 
     def _ingest_source(
         self,
@@ -777,7 +935,10 @@ class IngestionPipeline:
         metadata = chunk.metadata
         return PointStruct(
             id=chunk.chunk_id,
-            vector=vector,
+            vector={
+                "": vector,
+                settings.QDRANT_SPARSE_VECTOR_NAME: sparse_document(chunk.content),
+            },
             payload={
                 "content": chunk.content,
                 "parent_id": chunk.parent_id,
@@ -797,6 +958,10 @@ class IngestionPipeline:
 
     def _validate_generation(self, child_collection: str, parent_collection: str) -> None:
         """Run bounded integrity checks before aliases can become visible."""
+        self.qdrant.validate_sparse_coverage(
+            child_collection,
+            sparse_vector_name=settings.QDRANT_SPARSE_VECTOR_NAME,
+        )
         # Sample child references and resolve exactly those parent IDs.  Keeping
         # the first 10k parent IDs would falsely reject a large generation when
         # a sampled child points to a parent outside that arbitrary prefix.
@@ -843,6 +1008,7 @@ class IngestionPipeline:
             vector_dimension=self.embedder.dimension,
             expected_distance=Distance.COSINE,
             required_payload_indexes=("dataset_id", "file_name", "source_uri", "generation_id"),
+            require_sparse=True,
         )
         self.qdrant.validate_collection_schema(
             parent_collection,
@@ -910,12 +1076,41 @@ class IngestionPipeline:
 
     def _init_collections(self) -> None:
         """Tạo 2 collections trong Qdrant nếu chưa tồn tại."""
-        self.qdrant.create_vector_collection(settings.CHILD_COLLECTION)
-        self.qdrant.create_payload_collection(settings.PARENT_COLLECTION)
+        dimension = getattr(self.embedder, "dimension", settings.EMBEDDING_SIZE)
+        fingerprint = pipeline_fingerprint(embedding_dimension=dimension)
+        vector_create = self.qdrant.create_vector_collection
+        payload_create = self.qdrant.create_payload_collection
+        if self._accepts_keyword(vector_create, "schema_fingerprint"):
+            vector_create(
+                settings.CHILD_COLLECTION,
+                schema_fingerprint=fingerprint,
+                vector_dimension=dimension,
+            )
+        else:
+            # Lightweight PR11 test doubles retain the old one-argument API.
+            vector_create(settings.CHILD_COLLECTION)
+        if self._accepts_keyword(payload_create, "schema_fingerprint"):
+            payload_create(
+                settings.PARENT_COLLECTION,
+                schema_fingerprint=fingerprint,
+            )
+        else:
+            payload_create(settings.PARENT_COLLECTION)
         # Index để safe-replace/sync filter đúng dataset + relative file.
         for coll in (settings.CHILD_COLLECTION, settings.PARENT_COLLECTION):
             for field_name in ("dataset_id", "file_name"):
                 self.qdrant.create_payload_index(coll, field_name)
+
+    @staticmethod
+    def _accepts_keyword(function: Callable, name: str) -> bool:
+        try:
+            parameters = inspect.signature(function).parameters
+        except (TypeError, ValueError):
+            return False
+        return name in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
 
     def _parse_all_files(self, data_path: Path) -> ParseBatch:
         """Scan thư mục, parse tất cả files hỗ trợ.
@@ -1126,7 +1321,10 @@ class IngestionPipeline:
         points = [
             PointStruct(
                 id=chunk.chunk_id,
-                vector=chunk.embedding,
+                vector={
+                    "": chunk.embedding,
+                    settings.QDRANT_SPARSE_VECTOR_NAME: sparse_document(chunk.content),
+                },
                 payload={
                     "content": chunk.content,
                     "parent_id": chunk.parent_id,

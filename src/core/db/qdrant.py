@@ -19,8 +19,11 @@ Usage:
 from __future__ import annotations
 
 import random
+import re
 import time
+import unicodedata
 from collections.abc import Callable, Iterator
+from hashlib import blake2b
 from threading import Lock
 
 from qdrant_client import QdrantClient
@@ -30,13 +33,22 @@ from qdrant_client.models import (
     DeleteAlias,
     DeleteAliasOperation,
     Distance,
+    Document,
     FieldCondition,
     Filter,
     FilterSelector,
     HasIdCondition,
+    HasVectorCondition,
     MatchValue,
+    Modifier,
     PointIdsList,
     PointStruct,
+    Prefetch,
+    Rrf,
+    RrfQuery,
+    SparseIndexParams,
+    SparseVector,
+    SparseVectorParams,
     VectorParams,
 )
 from typing_extensions import Self
@@ -72,6 +84,9 @@ class QdrantConnector:
                         host=settings.QDRANT_HOST,
                         port=settings.QDRANT_PORT,
                         timeout=30,         # ★ mặc định có thể treo rất lâu
+                        # Send native Document values to Qdrant core for BM25
+                        # instead of requiring FastEmbed in the API/worker.
+                        cloud_inference=True,
                     )
                     logger.info(
                         "Connected to Qdrant",
@@ -97,6 +112,7 @@ class QdrantConnector:
                     schema_fingerprint=schema_fingerprint,
                     vector_dimension=vector_dimension or settings.EMBEDDING_SIZE,
                     expected_distance=Distance.COSINE,
+                    require_sparse=True,
                 )
             logger.info("Collection already exists", collection=collection_name)
             return
@@ -108,6 +124,14 @@ class QdrantConnector:
                     size=vector_dimension or settings.EMBEDDING_SIZE,
                     distance=Distance.COSINE,
                 ),
+                sparse_vectors_config={
+                    settings.QDRANT_SPARSE_VECTOR_NAME: SparseVectorParams(
+                        index=SparseIndexParams(
+                            on_disk=settings.QDRANT_SPARSE_ON_DISK,
+                        ),
+                        modifier=Modifier.IDF,
+                    )
+                },
                 metadata=(
                     {"schema_fingerprint": schema_fingerprint}
                     if schema_fingerprint else None
@@ -182,6 +206,7 @@ class QdrantConnector:
                 vector_dimension=dimension,
                 expected_distance=distance,
                 required_payload_indexes=("dataset_id", "file_name", "source_uri", "generation_id"),
+                require_sparse=dimension is not None,
             )
         return child_name, parent_name
 
@@ -205,10 +230,11 @@ class QdrantConnector:
             max_bytes=max_bytes or settings.INGEST_QDRANT_WRITE_MAX_BYTES,
             size_of=approximate_size,
         ):
+            write_batch = self._prepare_local_points(batch)
             self._with_retry(
-                lambda batch=batch: self.client.upsert(
+                lambda write_batch=write_batch: self.client.upsert(
                     collection_name=collection_name,
-                    points=batch,
+                    points=write_batch,
                     wait=True,
                 ),
                 operation=f"upsert {collection_name} ({len(batch)} points)",
@@ -404,6 +430,71 @@ class QdrantConnector:
             query=query_vector,
             limit=limit,
             query_filter=query_filter,
+            timeout=self._query_timeout(),
+        )
+        return result.points
+
+    def search_sparse(
+        self,
+        collection_name: str,
+        query,
+        *,
+        sparse_vector_name: str,
+        limit: int = 10,
+        query_filter: Filter | None = None,
+    ) -> list:
+        """Search a named sparse vector entirely inside Qdrant."""
+        result = self.client.query_points(
+            collection_name=collection_name,
+            query=self._prepare_local_sparse(query),
+            using=sparse_vector_name,
+            limit=limit,
+            query_filter=query_filter,
+            timeout=self._query_timeout(),
+        )
+        return result.points
+
+    def search_hybrid(
+        self,
+        collection_name: str,
+        *,
+        dense_vector: list[float],
+        sparse_query,
+        sparse_vector_name: str,
+        limit: int,
+        prefetch_limit: int,
+        query_filter: Filter | None,
+    ) -> list:
+        """Fuse dense and sparse candidates server-side using scoped RRF."""
+        prefetch = [
+            Prefetch(
+                query=dense_vector,
+                filter=query_filter,
+                limit=prefetch_limit,
+            ),
+            Prefetch(
+                query=sparse_query,
+                using=sparse_vector_name,
+                filter=query_filter,
+                limit=prefetch_limit,
+            ),
+        ]
+        if self._is_local_client:
+            prefetch[1] = Prefetch(
+                query=self._prepare_local_sparse(sparse_query),
+                using=sparse_vector_name,
+                filter=query_filter,
+                limit=prefetch_limit,
+            )
+        result = self.client.query_points(
+            collection_name=collection_name,
+            prefetch=prefetch,
+            query=RrfQuery(rrf=Rrf(k=61)),
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+            timeout=self._query_timeout(),
         )
         return result.points
 
@@ -494,17 +585,20 @@ class QdrantConnector:
                     offset=offset,
                     with_payload=True,
                     with_vectors=False,
+                    timeout=self._query_timeout(),
                 )
                 points.extend(batch)
                 if offset is None:
                     break
             return points
-        return self.client.retrieve(
+        points = self.client.retrieve(
             collection_name=collection_name,
             ids=ids,
             with_payload=True,
             with_vectors=False,
+            timeout=self._query_timeout(),
         )
+        return points
 
     def get_existing_ids(self, collection_name: str, ids: list[str]) -> set[str]:
         """Return IDs already persisted, closing the upsert/checkpoint gap."""
@@ -629,6 +723,7 @@ class QdrantConnector:
         vector_dimension: int | None,
         expected_distance: Distance | None,
         required_payload_indexes: tuple[str, ...] = (),
+        require_sparse: bool = False,
     ) -> None:
         """Fail closed when collection/model schema differs from the job."""
         info = self._with_retry(
@@ -663,6 +758,49 @@ class QdrantConnector:
             missing = []
         if missing:
             raise ValueError(f"Collection {collection_name} missing payload indexes: {missing}")
+        if require_sparse:
+            sparse_vectors = getattr(info.config.params, "sparse_vectors", None) or {}
+            sparse = sparse_vectors.get(settings.QDRANT_SPARSE_VECTOR_NAME)
+            if sparse is None:
+                raise ValueError(
+                    f"Collection {collection_name} missing sparse vector "
+                    f"{settings.QDRANT_SPARSE_VECTOR_NAME}"
+                )
+            if sparse.modifier != Modifier.IDF:
+                raise ValueError(
+                    f"Collection {collection_name} sparse modifier mismatch: "
+                    f"actual={sparse.modifier}, expected={Modifier.IDF}"
+                )
+
+    def validate_sparse_coverage(
+        self,
+        collection_name: str,
+        *,
+        sparse_vector_name: str,
+    ) -> None:
+        """Require every child point to carry the sparse vector before activation."""
+        total = self._with_retry(
+            lambda: self.client.count(
+                collection_name=collection_name,
+                exact=True,
+            ).count,
+            operation=f"count {collection_name}",
+        )
+        sparse = self._with_retry(
+            lambda: self.client.count(
+                collection_name=collection_name,
+                count_filter=Filter(
+                    must=[HasVectorCondition(has_vector=sparse_vector_name)]
+                ),
+                exact=True,
+            ).count,
+            operation=f"count sparse coverage {collection_name}",
+        )
+        if sparse != total:
+            raise ValueError(
+                f"Collection {collection_name} sparse coverage mismatch: "
+                f"sparse={sparse}, total={total}"
+            )
 
     def delete_collection(self, collection_name: str) -> None:
         """Delete an unused staging collection; callers must resolve exact names."""
@@ -677,6 +815,54 @@ class QdrantConnector:
     def _collection_exists(self, name: str) -> bool:
         collections = [c.name for c in self.client.get_collections().collections]
         return name in collections
+
+    def _prepare_local_points(self, points: list[PointStruct]) -> list[PointStruct]:
+        """Materialize native text documents for the in-memory dev backend.
+
+        Production Qdrant core receives a Document and performs native BM25.
+        The local client has no server inference unless FastEmbed is installed,
+        so tests use a deterministic hashed sparse vector while still querying
+        a bounded sparse index.
+        """
+        if not self._is_local_client:
+            return points
+        prepared: list[PointStruct] = []
+        for point in points:
+            vector = point.vector
+            if not isinstance(vector, dict):
+                prepared.append(point)
+                continue
+            converted = {
+                name: self._prepare_local_sparse(value)
+                for name, value in vector.items()
+            }
+            prepared.append(point.model_copy(update={"vector": converted}))
+        return prepared
+
+    @staticmethod
+    def _local_sparse_vector(text: str) -> SparseVector:
+        tokens = re.findall(
+            r"[^\W_]+(?:[-_][^\W_]+)*",
+            unicodedata.normalize("NFKC", text).casefold(),
+            re.UNICODE,
+        )
+        frequencies: dict[int, float] = {}
+        for token in tokens:
+            index = int.from_bytes(
+                blake2b(token.encode("utf-8"), digest_size=4).digest(),
+                "big",
+            )
+            frequencies[index] = frequencies.get(index, 0.0) + 1.0
+        indices = sorted(frequencies)
+        return SparseVector(
+            indices=indices,
+            values=[frequencies[index] for index in indices],
+        )
+
+    def _prepare_local_sparse(self, query):
+        if self._is_local_client and isinstance(query, Document):
+            return self._local_sparse_vector(query.text)
+        return query
 
     @property
     def _is_local_client(self) -> bool:
@@ -718,6 +904,13 @@ class QdrantConnector:
                     error_type=type(exc).__name__,
                 )
                 time.sleep(delay)
+
+    @staticmethod
+    def _query_timeout() -> int:
+        """Return the configured transport timeout for Qdrant reads."""
+        import math
+
+        return max(1, math.ceil(settings.QDRANT_QUERY_TIMEOUT_SECONDS))
 
     def close(self) -> None:
         if self._client:

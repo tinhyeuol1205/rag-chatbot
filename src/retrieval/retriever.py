@@ -11,7 +11,7 @@ Luồng xử lý đầy đủ:
       │     → [query_gốc, variant_1, variant_2, variant_3]
       │
       ├─② HyDE (LLM sinh hypothetical answer → embed)
-      │     → hyde_vector (384d)
+      │     → hyde_vector (1024d for BGE-M3)
       │
       ├─③ Hybrid Search cho MỖI query (Dense + BM25 + RRF)
       │     → 1 result_list cho mỗi query
@@ -34,10 +34,12 @@ Luồng xử lý đầy đủ:
 
 from __future__ import annotations
 
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from unicodedata import normalize
 
 from core import get_logger
+from core.config import settings
 from core.llm import get_llm_service
 from retrieval.context.assembler import AssembledContext, ContextAssembler, SourceRef
 from retrieval.context.parent_resolver import ParentResolver
@@ -133,8 +135,12 @@ class RAGRetriever:
         # ① + ② Song song hoá: expand và HyDE KHÔNG phụ thuộc nhau → tiết kiệm 1 LLM call
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=2) as pool:
-            f_expand = pool.submit(self.expander.expand, search_query)
-            f_hyde = pool.submit(self.hyde.generate_embedding, search_query)
+            # ContextVar carries the Redis reservation.  ThreadPoolExecutor
+            # does not inherit it automatically, so copy a context per task;
+            # otherwise optional LLM calls would see no reservation and be
+            # rejected in production mode.
+            f_expand = pool.submit(copy_context().run, self.expander.expand, search_query)
+            f_hyde = pool.submit(copy_context().run, self.hyde.generate_embedding, search_query)
             expanded_queries = f_expand.result()
             hyde_vector = f_hyde.result()
 
@@ -201,8 +207,10 @@ class RAGRetriever:
         API (không tốn tiền) và không chạy inference/query. Sample-free: truy cập
         property ``model`` là loader load model về RAM ngay (không embed thử).
         """
-        _ = self.searcher.dense.embedder.model
-        _ = self.reranker.model
+        if not self.searcher.dense.embedder.is_remote:
+            _ = self.searcher.dense.embedder.model
+        if not self.reranker.is_remote:
+            _ = self.reranker.model
         logger.info("RAG retriever warmed up")
 
     def query(self, user_query: str, stream: bool = False,
@@ -298,6 +306,7 @@ class RAGRetriever:
             user_prompt=user_prompt,
             system_prompt=SYSTEM_PROMPT,
             temperature=0.1,  # Thấp → trả lời sát context, ít hallucination
+            max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
         )
 
         logger.info("Answer generated", length=len(answer))
@@ -312,4 +321,5 @@ class RAGRetriever:
             user_prompt=user_prompt,
             system_prompt=SYSTEM_PROMPT,
             temperature=0.1,
+            max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
         )

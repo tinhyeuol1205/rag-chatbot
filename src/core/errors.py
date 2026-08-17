@@ -55,3 +55,31 @@ class RetrievalError(RAGChatbotError):
 
     error_code = "retrieval_unavailable"
     public_message = "Kho tài liệu tạm thời không khả dụng. Vui lòng thử lại sau."
+
+
+class QueueFullError(RAGChatbotError):
+    """The distributed admission queue has no outstanding-job capacity."""
+
+    error_code = "queue_full"
+    public_message = "Hệ thống đang bận. Vui lòng thử lại sau."
+
+
+class QueueUnavailableError(RAGChatbotError):
+    """Redis could not be reached; production must fail closed."""
+
+    error_code = "queue_unavailable"
+    public_message = "Hệ thống xếp hàng tạm thời không khả dụng. Vui lòng thử lại sau."
+
+
+class JobTimeoutError(RAGChatbotError):
+    """A queued job exceeded its result wait/retention contract."""
+
+    error_code = "job_timeout"
+    public_message = "Yêu cầu mất quá nhiều thời gian xử lý. Vui lòng thử lại."
+
+
+class JobFailedError(RAGChatbotError):
+    """The worker completed a job with an internal pipeline failure."""
+
+    error_code = "job_failed"
+    public_message = "Không thể hoàn tất yêu cầu. Vui lòng thử lại sau ít phút."

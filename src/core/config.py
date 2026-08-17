@@ -52,6 +52,23 @@ class Settings(BaseSettings):
             "INGEST_QDRANT_MAX_RETRIES": self.INGEST_QDRANT_MAX_RETRIES,
             "INGEST_GENERATION_RETENTION": self.INGEST_GENERATION_RETENTION,
             "INGEST_MAX_MEMORY_MB": self.INGEST_MAX_MEMORY_MB,
+            "RAG_QUEUE_MAX_OUTSTANDING": self.RAG_QUEUE_MAX_OUTSTANDING,
+            "RAG_JOB_MAX_WAIT_SECONDS": self.RAG_JOB_MAX_WAIT_SECONDS,
+            "RAG_JOB_TTL_SECONDS": self.RAG_JOB_TTL_SECONDS,
+            "RAG_WORKER_CONCURRENCY": self.RAG_WORKER_CONCURRENCY,
+            "LLM_RATE_LIMIT_CALLS": self.LLM_RATE_LIMIT_CALLS,
+            "LLM_RATE_LIMIT_WINDOW_SECONDS": self.LLM_RATE_LIMIT_WINDOW_SECONDS,
+            "LLM_HTTP_TIMEOUT_SECONDS": self.LLM_HTTP_TIMEOUT_SECONDS,
+            "EMBEDDING_HTTP_TIMEOUT_SECONDS": self.EMBEDDING_HTTP_TIMEOUT_SECONDS,
+            "RERANKER_HTTP_TIMEOUT_SECONDS": self.RERANKER_HTTP_TIMEOUT_SECONDS,
+            "LLM_RESERVATION_TTL_SECONDS": self.LLM_RESERVATION_TTL_SECONDS,
+            "QDRANT_QUERY_TIMEOUT_SECONDS": self.QDRANT_QUERY_TIMEOUT_SECONDS,
+            "SSE_SEND_TIMEOUT_SECONDS": self.SSE_SEND_TIMEOUT_SECONDS,
+            "LLM_MAX_OUTPUT_TOKENS": self.LLM_MAX_OUTPUT_TOKENS,
+            "EMBEDDING_SIZE": self.EMBEDDING_SIZE,
+            "QDRANT_HYBRID_PREFETCH_LIMIT": self.QDRANT_HYBRID_PREFETCH_LIMIT,
+            "QDRANT_SPARSE_AVG_LEN": self.QDRANT_SPARSE_AVG_LEN,
+            "MAX_CONTEXT_CHARS": self.MAX_CONTEXT_CHARS,
         }
         invalid = [name for name, value in positive_limits.items() if value <= 0]
         if invalid:
@@ -76,6 +93,33 @@ class Settings(BaseSettings):
         invalid_ratios = [name for name, value in ratios.items() if not 0 <= value <= 1]
         if invalid_ratios:
             raise ConfigurationError(f"Ingestion quality ratios must be between 0 and 1: {invalid_ratios}")
+        if self.RAG_EXECUTION_MODE not in {"inline", "redis_worker"}:
+            raise ConfigurationError("RAG_EXECUTION_MODE must be inline or redis_worker")
+        if self.EMBEDDING_RUNTIME not in {"local", "remote"}:
+            raise ConfigurationError("EMBEDDING_RUNTIME must be local or remote")
+        if self.RERANKER_RUNTIME not in {"local", "remote"}:
+            raise ConfigurationError("RERANKER_RUNTIME must be local or remote")
+        if self.EMBEDDING_RUNTIME == "remote" and not self.EMBEDDING_BASE_URL.strip():
+            raise ConfigurationError("EMBEDDING_RUNTIME=remote requires EMBEDDING_BASE_URL")
+        if self.RERANKER_RUNTIME == "remote" and not self.RERANKER_BASE_URL.strip():
+            raise ConfigurationError("RERANKER_RUNTIME=remote requires RERANKER_BASE_URL")
+        if self.APP_ENV.lower() in {"production", "prod"}:
+            if self.RAG_EXECUTION_MODE != "redis_worker":
+                raise ConfigurationError("Production requires RAG_EXECUTION_MODE=redis_worker")
+            if self.EMBEDDING_RUNTIME != "remote" or self.RERANKER_RUNTIME != "remote":
+                raise ConfigurationError("Production requires remote GPU embedding and reranker services")
+            if not self.EMBEDDING_MODEL_REVISION.strip() or not self.RERANKER_MODEL_REVISION.strip():
+                raise ConfigurationError("Production requires immutable embedding/reranker model revisions")
+            if self.EMBEDDING_MODEL_ID.lower() != "baai/bge-m3" or self.EMBEDDING_SIZE != 1024:
+                raise ConfigurationError("Production PR14 requires BAAI/bge-m3 with EMBEDDING_SIZE=1024")
+            if self.RERANKER_MODEL_ID.lower() != "baai/bge-reranker-v2-m3":
+                raise ConfigurationError("Production PR14 requires BAAI/bge-reranker-v2-m3")
+            if self.INGEST_SCHEMA_VERSION != "3":
+                raise ConfigurationError("Production PR14 requires INGEST_SCHEMA_VERSION=3")
+        if self.QDRANT_SPARSE_K <= 0 or not 0 <= self.QDRANT_SPARSE_B <= 1:
+            raise ConfigurationError(
+                "QDRANT_SPARSE_K must be positive and QDRANT_SPARSE_B must be between 0 and 1"
+            )
         return self
 
     # --- LLM Provider (chọn "openai" hoặc "gemini") ---
@@ -94,15 +138,25 @@ class Settings(BaseSettings):
     QDRANT_HOST: str = "localhost"
     QDRANT_PORT: int = 6333
 
-    # --- Embedding Model ---
-    EMBEDDING_MODEL_ID: str = "BAAI/bge-small-en-v1.5"
-    EMBEDDING_SIZE: int = 384
+    # --- Embedding Model / GPU inference contract ---
+    EMBEDDING_MODEL_ID: str = "BAAI/bge-m3"
+    EMBEDDING_MODEL_REVISION: str = ""
+    EMBEDDING_SIZE: int = 1024
     EMBEDDING_DEVICE: str = "cpu"
+    EMBEDDING_RUNTIME: str = "local"  # remote in production; local is dev/test adapter
+    EMBEDDING_BASE_URL: str = "http://embedding-gpu:8080"
+    EMBEDDING_HTTP_TIMEOUT_SECONDS: float = 30.0
+    EMBEDDING_NORMALIZE: bool = True
 
     # --- Reranker Model ---
     RERANKER_MODEL_ID: str = "BAAI/bge-reranker-v2-m3"
+    RERANKER_MODEL_REVISION: str = ""
     RERANK_CANDIDATES: int = 30    # Số candidate tối đa đưa vào cross-encoder
     RERANK_BATCH_SIZE: int = 16
+    RERANKER_DEVICE: str = ""  # empty -> reuse EMBEDDING_DEVICE in local mode
+    RERANKER_RUNTIME: str = "local"  # remote in production; local is dev/test adapter
+    RERANKER_BASE_URL: str = "http://reranker-gpu:8080"
+    RERANKER_HTTP_TIMEOUT_SECONDS: float = 30.0
 
     # --- API ---
     CORS_ORIGINS: list[str] = ["http://localhost:7860", "http://127.0.0.1:7860"]
@@ -117,6 +171,37 @@ class Settings(BaseSettings):
     KEEP_TOP_K: int = 5      # Giữ lại bao nhiêu sau reranking
     EXPAND_N_QUERY: int = 3  # Tạo bao nhiêu biến thể câu hỏi
     MAX_CONTEXT_CHARS: int = 24_000  # ~6k token — an toàn cho model 8k+
+
+    # --- Redis admission queue / distributed provider quota ---
+    APP_ENV: str = "development"
+    RAG_EXECUTION_MODE: str = "inline"  # redis_worker is mandatory in production
+    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_KEY_PREFIX: str = "rag:default"
+    REDIS_QUEUE_STREAM: str = "rag:default:jobs"
+    REDIS_QUEUE_GROUP: str = "rag-workers"
+    REDIS_OUTSTANDING_KEY: str = "rag:default:outstanding"
+    REDIS_RATE_SCHEDULE_KEY: str = "rag:default:llm_schedule"
+    REDIS_RATE_RESERVATION_PREFIX: str = "rag:default:reservation:"
+    REDIS_JOB_PREFIX: str = "rag:default:job:"
+    REDIS_IDEMPOTENCY_PREFIX: str = "rag:default:idempotency:"
+    REDIS_CONNECT_TIMEOUT_SECONDS: float = 2.0
+    REDIS_SOCKET_TIMEOUT_SECONDS: float = 2.0
+    REDIS_RESULT_POLL_SECONDS: float = 0.1
+    RAG_QUEUE_MAX_OUTSTANDING: int = 32
+    RAG_JOB_MAX_WAIT_SECONDS: float = 180.0
+    RAG_JOB_TTL_SECONDS: int = 600
+    RAG_WORKER_CONCURRENCY: int = 2
+    RAG_WORKER_LEASE_SECONDS: int = 300
+    LLM_RATE_LIMIT_CALLS: int = 15
+    LLM_RATE_LIMIT_WINDOW_SECONDS: float = 60.0
+    LLM_RESERVATION_TTL_SECONDS: int = 600
+    LLM_HTTP_TIMEOUT_SECONDS: float = 60.0
+    QDRANT_QUERY_TIMEOUT_SECONDS: float = 8.0
+    SSE_SEND_TIMEOUT_SECONDS: float = 15.0
+
+    # Generation output cap remains a cost/latency control.  PR14 removes only
+    # token-aware input-context accounting from the assembler.
+    LLM_MAX_OUTPUT_TOKENS: int = 1_024
 
     # --- Chunking Parameters ---
     CHILD_CHUNK_SIZE: int = 400      # Chunk nhỏ (search chính xác)
@@ -136,8 +221,8 @@ class Settings(BaseSettings):
     # --- Versioned ingestion ---
     INGEST_VERSIONED: bool = True
     INGEST_MANIFEST_PATH: str = "data/ingest_runs/manifest.sqlite3"
-    INGEST_PIPELINE_VERSION: str = "11.0"
-    INGEST_SCHEMA_VERSION: str = "1"
+    INGEST_PIPELINE_VERSION: str = "14.0"
+    INGEST_SCHEMA_VERSION: str = "3"
     INGEST_PARSER_VERSION: str = "2"
     INGEST_CHUNKER_VERSION: str = "2"
     INGEST_EMBEDDING_MODEL_REVISION: str = ""
@@ -157,6 +242,17 @@ class Settings(BaseSettings):
     INGEST_FAIL_ON_QUALITY: bool = True
     INGEST_PDF_FAST_STRATEGY: str = "fast"
     INGEST_PDF_OCR_STRATEGY: str = "hi_res"
+
+    # --- Qdrant native BM25 / server-side hybrid retrieval ---
+    QDRANT_SPARSE_VECTOR_NAME: str = "bm25"
+    QDRANT_SPARSE_MODEL: str = "Qdrant/bm25"
+    QDRANT_SPARSE_TOKENIZER: str = "multilingual"
+    QDRANT_SPARSE_LANGUAGE: str = "none"
+    QDRANT_SPARSE_K: float = 1.2
+    QDRANT_SPARSE_B: float = 0.75
+    QDRANT_SPARSE_AVG_LEN: int = 256
+    QDRANT_SPARSE_ON_DISK: bool = True
+    QDRANT_HYBRID_PREFETCH_LIMIT: int = 40
 
     # --- Ingestion namespace ---
     # Dùng để sync đúng dataset, không đụng points của source directory khác.

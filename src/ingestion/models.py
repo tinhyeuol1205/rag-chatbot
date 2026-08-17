@@ -120,11 +120,11 @@ class Chunk(BaseModel):
 class EmbeddedChunk(BaseModel):
     """
     Sau khi embedding → EmbeddedChunk.
-    Thêm vector embedding (384 dimensions) để lưu vào Qdrant.
+    Thêm vector embedding (1024 dimensions mặc định của BGE-M3) để lưu vào Qdrant.
     """
 
     chunk_id: str
     content: str
-    embedding: list[float]   # Vector 384d từ bge-small-en
+    embedding: list[float]   # Vector BGE-M3; dimension được validate theo config
     parent_id: str | None = None
     metadata: DocumentMetadata

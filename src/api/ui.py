@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import gradio as gr
 
-from api.chat import chat_stream_events, get_retriever
+from api.chat import _normalize_history, chat_stream_events, get_retriever
 from core import get_logger
+from core.admission_queue import InlineAdmissionQueue, get_admission_queue
+from core.config import settings
+from core.errors import RAGChatbotError
 
 logger = get_logger(__name__)
 
@@ -41,9 +44,38 @@ def respond(message: str, chat_history: list):
     Yields:
         Từng token để Gradio hiển thị streaming
     """
+    # The UI is also an entry point.  Route it through the same admission
+    # boundary as FastAPI so Gradio's own unbounded queue cannot bypass the
+    # provider quota in production.  The Redis path returns a completed result
+    # (the API SSE endpoint remains the preferred streaming client).
+    history = _normalize_history(chat_history or [])
+    queue = get_admission_queue()
+    try:
+        if isinstance(queue, InlineAdmissionQueue):
+            events = queue.execute(
+                lambda query, pairs: list(chat_stream_events(query, history=pairs)),
+                message,
+                history,
+            )
+        else:
+            job = queue.enqueue(message, history)
+            payload = queue.wait_result(job.job_id)
+            events = [
+                {"event": "token", "data": payload.get("answer", "")},
+                {"event": "sources", "data": payload.get("sources", [])},
+                {"event": "end", "data": {}},
+            ]
+    except RAGChatbotError as exc:
+        yield f"⚠️ {exc.public_message}"
+        return
+    except Exception:
+        logger.exception("UI request failed")
+        yield "Xin lỗi, hệ thống đang bận. Vui lòng thử lại sau."
+        return
+
     # Streaming: ghép token và render sources sau khi generation kết thúc.
     response = ""
-    for event in chat_stream_events(message, history=chat_history):
+    for event in events:
         if isinstance(event, str):
             # Tương thích với caller/test cũ nếu event adapter bị thay thế.
             response += event
@@ -89,6 +121,12 @@ def create_ui() -> gr.ChatInterface:
         description="Ask questions about company policies and engineering practices.\nPowered by **Advanced RAG** (Hybrid Search, Reranking, Parent-Child Retrieval).",
         examples=EXAMPLE_QUESTIONS,
         cache_examples=False,
+    )
+    # Keep Gradio's front-door queue bounded as well.  It is not the provider
+    # limiter (Redis is authoritative), but prevents an unbounded UI backlog.
+    demo.queue(
+        max_size=settings.RAG_QUEUE_MAX_OUTSTANDING,
+        default_concurrency_limit=settings.RAG_WORKER_CONCURRENCY,
     )
 
     return demo

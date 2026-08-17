@@ -75,20 +75,32 @@ class ParentResolver:
             logger.info("No parent_ids found, returning child chunks as-is")
             return child_results
 
-        # Lấy parent chunks từ Qdrant
-        parent_points = self.qdrant.get_by_ids(
-            settings.PARENT_COLLECTION,
-            parent_ids,
-            query_filter=scope.qdrant_filter(),
-        )
+        # Pin parent reads to the concrete generation carried by each child.
+        # Alias resolution can change between the child search and this lookup;
+        # using the active parent alias then could mix generations or fall back
+        # to stale child text after an alias switch.  Legacy points without a
+        # generation id retain the PR11 alias behavior.
+        grouped_ids: dict[str | None, list[str]] = {}
+        for doc in child_results:
+            parent_id = doc.get("parent_id")
+            if parent_id:
+                generation = doc.get("generation_id") or None
+                grouped_ids.setdefault(generation, []).append(str(parent_id))
 
-        # Tạo lookup: parent_id → parent content
-        # Cả 2 phía đều là UUID canonical (PR 3 / P2-5) → không cần normalize dấu '-'
-        parent_map = {
-            str(point.id): point.payload
-            for point in parent_points
-            if point.payload and scope.allows(point.payload.get("dataset_id"))
-        }
+        parent_map: dict[tuple[str, str | None], dict] = {}
+        for generation, ids in grouped_ids.items():
+            collection = (
+                f"{settings.PARENT_COLLECTION}__{generation}"
+                if generation else settings.PARENT_COLLECTION
+            )
+            parent_points = self.qdrant.get_by_ids(
+                collection,
+                list(dict.fromkeys(ids)),
+                query_filter=scope.qdrant_filter(),
+            )
+            for point in parent_points:
+                if point.payload and scope.allows(point.payload.get("dataset_id")):
+                    parent_map[(str(point.id), generation)] = point.payload
 
         # Thay child content bằng parent content
         resolved = []
@@ -109,7 +121,8 @@ class ParentResolver:
                 deduped += 1
                 continue
 
-            parent_payload = parent_map.get(pid)
+            generation = doc.get("generation_id") or None
+            parent_payload = parent_map.get((pid, generation))
             if parent_payload is None:
                 # ★ FALLBACK: parent mất trong DB → dùng child, KHÔNG được xoá
                 # (VD sau re-ingest: child cũ còn trỏ tới parent đã không tồn tại)
@@ -127,6 +140,7 @@ class ParentResolver:
                 "section_title": parent_payload.get("section_title") or doc.get("section_title", ""),
                 "page_number": parent_payload.get("page_number") or doc.get("page_number"),
                 "dataset_id": parent_payload.get("dataset_id"),
+                "generation_id": generation or parent_payload.get("generation_id"),
                 "is_parent": True,
             })
 

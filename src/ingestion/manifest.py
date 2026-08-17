@@ -48,9 +48,23 @@ def pipeline_fingerprint(
         "parser_version": parser_version or settings.INGEST_PARSER_VERSION,
         "chunker_version": chunker_version or settings.INGEST_CHUNKER_VERSION,
         "embedding_model_id": settings.EMBEDDING_MODEL_ID,
-        "embedding_model_revision": settings.INGEST_EMBEDDING_MODEL_REVISION,
+        # Online and ingestion settings must describe the same immutable model
+        # contract.  Keep the legacy ingest override for backwards-compatible
+        # deployments, but prefer the PR14 runtime revision when it is set.
+        "embedding_model_revision": (
+            settings.EMBEDDING_MODEL_REVISION or settings.INGEST_EMBEDDING_MODEL_REVISION
+        ),
         "embedding_dimension": embedding_dimension,
-        "embedding_normalize": True,
+        "embedding_normalize": settings.EMBEDDING_NORMALIZE,
+        "embedding_runtime": settings.EMBEDDING_RUNTIME,
+        "sparse_model": settings.QDRANT_SPARSE_MODEL,
+        "sparse_vector_name": settings.QDRANT_SPARSE_VECTOR_NAME,
+        "sparse_tokenizer": settings.QDRANT_SPARSE_TOKENIZER,
+        "sparse_language": settings.QDRANT_SPARSE_LANGUAGE,
+        "sparse_k": settings.QDRANT_SPARSE_K,
+        "sparse_b": settings.QDRANT_SPARSE_B,
+        "sparse_avg_len": settings.QDRANT_SPARSE_AVG_LEN,
+        "sparse_on_disk": settings.QDRANT_SPARSE_ON_DISK,
         "parent_chunk_size": settings.PARENT_CHUNK_SIZE,
         "parent_chunk_overlap": settings.PARENT_CHUNK_OVERLAP,
         "child_chunk_size": settings.CHILD_CHUNK_SIZE,
@@ -74,6 +88,15 @@ def pipeline_fingerprint(
 
 @dataclass(frozen=True)
 class SourceRecord:
+    """Active source metadata plus an isolated in-progress staging state.
+
+    The unprefixed fields always describe the generation currently visible to
+    retrieval.  ``working_*`` fields describe a resumable generation that has
+    not been activated yet.  Keeping the two states separate is essential for
+    schema migrations: a failed working run must never make an older active
+    collection look as if it already used the new schema.
+    """
+
     dataset_id: str
     source_uri: str
     content_sha256: str
@@ -87,6 +110,15 @@ class SourceRecord:
     child_count: int = 0
     quality: dict[str, Any] | None = None
     error_code: str | None = None
+    working_content_sha256: str | None = None
+    working_size_bytes: int | None = None
+    working_mtime_ns: int | None = None
+    working_fingerprint: str | None = None
+    working_status: str | None = None
+    working_parent_count: int = 0
+    working_child_count: int = 0
+    working_quality: dict[str, Any] | None = None
+    working_error_code: str | None = None
     updated_at: float = 0.0
 
     @classmethod
@@ -105,6 +137,18 @@ class SourceRecord:
             child_count=row["child_count"] or 0,
             quality=json.loads(row["quality_json"]) if row["quality_json"] else None,
             error_code=row["error_code"],
+            working_content_sha256=row["working_content_sha256"],
+            working_size_bytes=row["working_size_bytes"],
+            working_mtime_ns=row["working_mtime_ns"],
+            working_fingerprint=row["working_fingerprint"],
+            working_status=row["working_status"],
+            working_parent_count=row["working_parent_count"] or 0,
+            working_child_count=row["working_child_count"] or 0,
+            working_quality=(
+                json.loads(row["working_quality_json"])
+                if row["working_quality_json"] else None
+            ),
+            working_error_code=row["working_error_code"],
             updated_at=row["updated_at"] or 0.0,
         )
 
@@ -157,6 +201,15 @@ class ManifestStore:
                     child_count INTEGER NOT NULL DEFAULT 0,
                     quality_json TEXT,
                     error_code TEXT,
+                    working_content_sha256 TEXT,
+                    working_size_bytes INTEGER,
+                    working_mtime_ns INTEGER,
+                    working_fingerprint TEXT,
+                    working_status TEXT,
+                    working_parent_count INTEGER NOT NULL DEFAULT 0,
+                    working_child_count INTEGER NOT NULL DEFAULT 0,
+                    working_quality_json TEXT,
+                    working_error_code TEXT,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (dataset_id, source_uri)
                 );
@@ -190,6 +243,59 @@ class ManifestStore:
                 );
                 """
             )
+            # SQLite has no portable ``ADD COLUMN IF NOT EXISTS``.  Upgrade a
+            # PR11 manifest in place before constructing ``SourceRecord``.
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(source_manifest)").fetchall()
+            }
+            working_columns = {
+                "working_content_sha256": "TEXT",
+                "working_size_bytes": "INTEGER",
+                "working_mtime_ns": "INTEGER",
+                "working_fingerprint": "TEXT",
+                "working_status": "TEXT",
+                "working_parent_count": "INTEGER NOT NULL DEFAULT 0",
+                "working_child_count": "INTEGER NOT NULL DEFAULT 0",
+                "working_quality_json": "TEXT",
+                "working_error_code": "TEXT",
+            }
+            upgrading_legacy_manifest = any(name not in columns for name in working_columns)
+            for name, definition in working_columns.items():
+                if name not in columns:
+                    connection.execute(
+                        f"ALTER TABLE source_manifest ADD COLUMN {name} {definition}"
+                    )
+
+            if upgrading_legacy_manifest:
+                # Old code overwrote the active hash/fingerprint while a
+                # generation was running.  Such rows cannot be proven safe for
+                # carry-forward, so preserve their values as working metadata
+                # and invalidate only the active metadata.  The next full sync
+                # will reprocess them instead of copying a potentially PR11
+                # vector into a native-sparse collection.
+                connection.execute(
+                    """
+                    UPDATE source_manifest SET
+                        working_content_sha256=content_sha256,
+                        working_size_bytes=size_bytes,
+                        working_mtime_ns=mtime_ns,
+                        working_fingerprint=fingerprint,
+                        working_status=status,
+                        working_parent_count=parent_count,
+                        working_child_count=child_count,
+                        working_quality_json=quality_json,
+                        working_error_code=error_code,
+                        content_sha256='', size_bytes=0, mtime_ns=0,
+                        fingerprint='', status=CASE
+                            WHEN active_generation IS NULL THEN 'removed'
+                            ELSE 'unverified'
+                        END,
+                        parent_count=0, child_count=0,
+                        quality_json=NULL, error_code=NULL
+                    WHERE working_generation IS NOT NULL
+                    """
+                )
             connection.commit()
             if self.path != ":memory:":
                 connection.close()
@@ -245,7 +351,14 @@ class ManifestStore:
         fingerprint: str,
         generation_id: str,
     ) -> SourceRecord | None:
-        """Upsert discovery metadata and return the previous source record."""
+        """Stage discovery metadata without mutating the active snapshot.
+
+        The active hash/fingerprint/counts describe the generation currently
+        served.  A failed migration must never make those fields look like the
+        new schema, otherwise a retry can copy dense-only PR11 points into a
+        PR14 generation.  New discovery data therefore lives in ``working_*``
+        columns until :meth:`activate_generation` promotes it atomically.
+        """
         now = time.time()
         with self._lock:
             connection = self._connect()
@@ -256,9 +369,9 @@ class ManifestStore:
             previous = SourceRecord.from_row(previous_row) if previous_row else None
             unchanged = bool(
                 previous
+                and previous.status == "committed"
                 and previous.content_sha256 == content_sha256
                 and previous.fingerprint == fingerprint
-                and previous.status == "committed"
             )
             status = "committed" if unchanged else "discovered"
             connection.execute(
@@ -269,23 +382,26 @@ class ManifestStore:
                     parent_count, child_count, quality_json, error_code, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dataset_id, source_uri) DO UPDATE SET
-                    content_sha256=excluded.content_sha256,
-                    size_bytes=excluded.size_bytes,
-                    mtime_ns=excluded.mtime_ns,
-                    fingerprint=excluded.fingerprint,
                     status=excluded.status,
+                    working_content_sha256=excluded.content_sha256,
+                    working_size_bytes=excluded.size_bytes,
+                    working_mtime_ns=excluded.mtime_ns,
+                    working_fingerprint=excluded.fingerprint,
+                    working_status=excluded.status,
                     working_generation=excluded.working_generation,
-                    error_code=CASE WHEN excluded.status='discovered' THEN NULL ELSE source_manifest.error_code END,
+                    working_error_code=NULL,
                     updated_at=excluded.updated_at
                 """,
                 (
                     dataset_id,
                     source_uri,
-                    content_sha256,
-                    size_bytes,
-                    mtime_ns,
-                    fingerprint,
-                    status,
+                    # No active snapshot exists yet.  Keep the row valid but
+                    # deliberately uncommitted until alias activation.
+                    previous.content_sha256 if previous else "",
+                    previous.size_bytes if previous else 0,
+                    previous.mtime_ns if previous else 0,
+                    previous.fingerprint if previous else "",
+                    status if previous else "unverified",
                     previous.active_generation if previous else None,
                     generation_id,
                     previous.parent_count if previous else 0,
@@ -293,6 +409,28 @@ class ManifestStore:
                     json.dumps(previous.quality, sort_keys=True) if previous and previous.quality else None,
                     previous.error_code if previous else None,
                     now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE source_manifest SET
+                    working_content_sha256=?, working_size_bytes=?,
+                    working_mtime_ns=?, working_fingerprint=?, working_status=?,
+                    working_generation=?, working_parent_count=0,
+                    working_child_count=0, working_quality_json=NULL,
+                    working_error_code=NULL, updated_at=?
+                WHERE dataset_id=? AND source_uri=?
+                """,
+                (
+                    content_sha256,
+                    size_bytes,
+                    mtime_ns,
+                    fingerprint,
+                    status,
+                    generation_id,
+                    now,
+                    dataset_id,
+                    source_uri,
                 ),
             )
             connection.commit()
@@ -316,27 +454,96 @@ class ManifestStore:
         now = time.time()
         with self._lock:
             connection = self._connect()
+            quality_json = json.dumps(quality, sort_keys=True) if quality is not None else None
+            if active_generation is not None:
+                # Explicit active updates are retained for the small PR11
+                # compatibility API.  Versioned ingestion uses promotion below.
+                connection.execute(
+                    """
+                    UPDATE source_manifest SET
+                        content_sha256=COALESCE(NULLIF(working_content_sha256, ''), content_sha256),
+                        size_bytes=COALESCE(working_size_bytes, size_bytes),
+                        mtime_ns=COALESCE(working_mtime_ns, mtime_ns),
+                        fingerprint=COALESCE(NULLIF(working_fingerprint, ''), fingerprint),
+                        status=?, active_generation=?,
+                        parent_count=?, child_count=?, quality_json=?, error_code=?,
+                        updated_at=?, working_generation=NULL,
+                        working_content_sha256=NULL, working_size_bytes=NULL,
+                        working_mtime_ns=NULL, working_fingerprint=NULL,
+                        working_status=NULL, working_parent_count=0,
+                        working_child_count=0, working_quality_json=NULL,
+                        working_error_code=NULL WHERE dataset_id=? AND source_uri=?
+                    """,
+                    (
+                        status, active_generation, parent_count, child_count,
+                        quality_json, error_code, now, dataset_id, source_uri,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE source_manifest SET working_status=?,
+                        working_generation=COALESCE(?, working_generation),
+                        working_parent_count=?, working_child_count=?,
+                        working_quality_json=?, working_error_code=?, updated_at=?
+                    WHERE dataset_id=? AND source_uri=?
+                    """,
+                    (
+                        status, generation_id, parent_count, child_count,
+                        quality_json, error_code, now, dataset_id, source_uri,
+                    ),
+                )
+            connection.commit()
+            if self.path != ":memory:":
+                connection.close()
+
+    def stage_active_source(
+        self,
+        *,
+        dataset_id: str,
+        source_uri: str,
+        generation_id: str,
+    ) -> None:
+        """Copy verified active metadata into a new generation's work state."""
+        with self._lock:
+            connection = self._connect()
             connection.execute(
                 """
                 UPDATE source_manifest SET
-                    status=?,
-                    working_generation=COALESCE(?, working_generation),
-                    active_generation=COALESCE(?, active_generation),
-                    parent_count=?, child_count=?, quality_json=?, error_code=?, updated_at=?
+                    working_content_sha256=content_sha256,
+                    working_size_bytes=size_bytes,
+                    working_mtime_ns=mtime_ns,
+                    working_fingerprint=fingerprint,
+                    working_status='discovered',
+                    working_generation=?,
+                    working_parent_count=parent_count,
+                    working_child_count=child_count,
+                    working_quality_json=quality_json,
+                    working_error_code=NULL,
+                    updated_at=?
                 WHERE dataset_id=? AND source_uri=?
+                  AND active_generation IS NOT NULL
+                  AND content_sha256 <> '' AND fingerprint <> ''
                 """,
-                (
-                    status,
-                    generation_id,
-                    active_generation,
-                    parent_count,
-                    child_count,
-                    json.dumps(quality, sort_keys=True) if quality is not None else None,
-                    error_code,
-                    now,
-                    dataset_id,
-                    source_uri,
-                ),
+                (generation_id, time.time(), dataset_id, source_uri),
+            )
+            connection.commit()
+            if self.path != ":memory:":
+                connection.close()
+
+    def clear_source_checkpoints(
+        self,
+        *,
+        dataset_id: str,
+        generation_id: str,
+        source_uri: str,
+    ) -> None:
+        """Invalidate resumable batches when a source's bytes are replaced."""
+        with self._lock:
+            connection = self._connect()
+            connection.execute(
+                "DELETE FROM batch_checkpoints WHERE dataset_id=? AND generation_id=? AND source_uri=?",
+                (dataset_id, generation_id, source_uri),
             )
             connection.commit()
             if self.path != ":memory:":
@@ -451,6 +658,19 @@ class ManifestStore:
                 connection.close()
             return dict(row) if row else None
 
+    def get_job_for_generation(self, dataset_id: str, generation_id: str) -> dict[str, Any] | None:
+        """Return the newest control-plane job for a generation."""
+        with self._lock:
+            connection = self._connect()
+            row = connection.execute(
+                "SELECT * FROM ingest_jobs WHERE dataset_id=? AND generation_id=? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (dataset_id, generation_id),
+            ).fetchone()
+            if self.path != ":memory:":
+                connection.close()
+            return dict(row) if row else None
+
     def finish_job(
         self,
         *,
@@ -494,6 +714,18 @@ class ManifestStore:
                 connection.close()
             return [row["generation_id"] for row in rows]
 
+    def is_generation_committed(self, dataset_id: str, generation_id: str) -> bool:
+        """Return whether a generation is immutable and already served/committed."""
+        with self._lock:
+            connection = self._connect()
+            row = connection.execute(
+                "SELECT 1 FROM ingest_jobs WHERE dataset_id=? AND generation_id=? AND status='committed' LIMIT 1",
+                (dataset_id, generation_id),
+            ).fetchone()
+            if self.path != ":memory:":
+                connection.close()
+            return row is not None
+
     def activate_generation(
         self,
         *,
@@ -514,10 +746,25 @@ class ManifestStore:
                     batch = ordered_sources[start:start + self._SQLITE_IN_BATCH]
                     placeholders = ",".join("?" for _ in batch)
                     connection.execute(
-                        f"UPDATE source_manifest SET active_generation=?, status='committed', "
-                        f"updated_at=?, working_generation=NULL WHERE dataset_id=? "
-                        f"AND source_uri IN ({placeholders})",
-                        (generation_id, time.time(), dataset_id, *batch),
+                        f"""
+                        UPDATE source_manifest SET
+                            content_sha256=COALESCE(NULLIF(working_content_sha256, ''), content_sha256),
+                            size_bytes=COALESCE(working_size_bytes, size_bytes),
+                            mtime_ns=COALESCE(working_mtime_ns, mtime_ns),
+                            fingerprint=COALESCE(NULLIF(working_fingerprint, ''), fingerprint),
+                            status='committed', active_generation=?,
+                            parent_count=working_parent_count, child_count=working_child_count,
+                            quality_json=working_quality_json, error_code=NULL,
+                            updated_at=?, working_generation=NULL,
+                            working_content_sha256=NULL, working_size_bytes=NULL,
+                            working_mtime_ns=NULL, working_fingerprint=NULL,
+                            working_status=NULL, working_parent_count=0,
+                            working_child_count=0, working_quality_json=NULL,
+                            working_error_code=NULL
+                        WHERE dataset_id=? AND source_uri IN ({placeholders})
+                          AND working_generation=?
+                        """,
+                        (generation_id, time.time(), dataset_id, *batch, generation_id),
                     )
             connection.commit()
             if self.path != ":memory:":

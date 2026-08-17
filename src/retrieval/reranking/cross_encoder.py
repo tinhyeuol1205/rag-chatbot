@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from threading import Lock
 
+import httpx
 from sentence_transformers import CrossEncoder
 
 from core import get_logger
@@ -54,10 +55,15 @@ def _load_reranker() -> CrossEncoder:
         with _reranker_model_lock:          # slow path — lấy lock
             if _reranker_model is None:     # double-check LẠI sau khi có lock
                 logger.info("Loading reranker model", model=settings.RERANKER_MODEL_ID)
+                kwargs = {
+                    "device": settings.RERANKER_DEVICE or settings.EMBEDDING_DEVICE,
+                    "max_length": 512,
+                }
+                if settings.RERANKER_MODEL_REVISION:
+                    kwargs["revision"] = settings.RERANKER_MODEL_REVISION
                 model = CrossEncoder(
                     settings.RERANKER_MODEL_ID,
-                    device=settings.EMBEDDING_DEVICE,
-                    max_length=512,         # ★ chặn input dài → chậm bất định
+                    **kwargs,
                 )
                 _reranker_model = model     # publish chỉ sau load thành công
                 logger.info("Reranker loaded")
@@ -65,10 +71,16 @@ def _load_reranker() -> CrossEncoder:
 
 
 class CrossEncoderReranker:
-    """Rerank kết quả search bằng Cross-Encoder model."""
+    """Rerank through a GPU service in production or local model in dev."""
+
+    @property
+    def is_remote(self) -> bool:
+        return settings.RERANKER_RUNTIME == "remote"
 
     @property
     def model(self) -> CrossEncoder:
+        if self.is_remote:
+            raise RuntimeError("Remote reranker runtime does not expose an in-process model")
         return _load_reranker()             # ★ cache module-level, không reload
 
     def rerank(self, query: str, documents: list[dict]) -> list[dict]:
@@ -93,9 +105,13 @@ class CrossEncoderReranker:
         # Tạo pairs: [(query, doc_content), (query, doc_content), ...]
         pairs = [(query, doc["content"]) for doc in candidates]
 
-        # Cross-Encoder scoring — chấm điểm từng cặp (lock vì không thread-safe)
-        with _predict_lock:
-            scores = self.model.predict(pairs, batch_size=settings.RERANK_BATCH_SIZE)
+        if self.is_remote:
+            scores = self._remote_predict(query, [doc["content"] for doc in candidates])
+        else:
+            # Local adapter only. GPU service concurrency is owned by the
+            # inference deployment, not by an API-process limiter.
+            with _predict_lock:
+                scores = self.model.predict(pairs, batch_size=settings.RERANK_BATCH_SIZE)
 
         # ★ KHÔNG mutate list/dict của caller (bug P3-4):
         # copy sang dict mới rồi mới sort, input ban đầu giữ nguyên
@@ -114,3 +130,26 @@ class CrossEncoderReranker:
 
         return top_docs
 
+    @staticmethod
+    def _remote_predict(query: str, documents: list[str]) -> list[float]:
+        url = settings.RERANKER_BASE_URL.rstrip("/") + "/rerank"
+        payload = {
+            "model": settings.RERANKER_MODEL_ID,
+            "revision": settings.RERANKER_MODEL_REVISION,
+            "query": query,
+            "documents": documents,
+        }
+        try:
+            response = httpx.post(url, json=payload, timeout=settings.RERANKER_HTTP_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            body = response.json()
+        except Exception as exc:
+            logger.warning("Remote reranker service failed", error_type=type(exc).__name__)
+            raise ConnectionError("Reranker service unavailable") from exc
+        values = body.get("scores") if isinstance(body, dict) else body
+        if not isinstance(values, list) or len(values) != len(documents):
+            raise ValueError("Reranker service returned invalid score cardinality")
+        try:
+            return [float(value) for value in values]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Reranker service returned non-numeric scores") from exc

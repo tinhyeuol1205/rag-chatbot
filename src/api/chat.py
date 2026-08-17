@@ -64,18 +64,21 @@ def chat(query: str) -> str:
         return USER_FACING_ERROR                        # ★ không leak ra ngoài
 
 
-def chat_or_raise(query: str) -> str:
+def chat_or_raise(query: str, history: list[tuple[str, str]] | None = None) -> str:
     """Bản cho API layer — raise để FastAPI trả HTTP status đúng."""
     if not query.strip():
         return "Please enter a question."
-    return get_retriever().query(query, stream=False)
+    return get_retriever().query(query, stream=False, history=history)
 
 
-def chat_or_raise_with_sources(query: str) -> RAGResult:
+def chat_or_raise_with_sources(
+    query: str,
+    history: list[tuple[str, str]] | None = None,
+) -> RAGResult:
     """API variant trả answer cùng sources đã thực sự đưa vào prompt."""
     if not query.strip():
         return RAGResult(answer="Please enter a question.")
-    return get_retriever().query_with_context(query)
+    return get_retriever().query_with_context(query, history=history)
 
 
 def chat_stream(query: str, history: list | None = None):

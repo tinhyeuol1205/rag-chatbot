@@ -1,6 +1,6 @@
 # PR11 — bảng thay đổi source và hướng dẫn vận hành
 
-Tài liệu này mô tả trạng thái source hiện tại sau PR11, bao gồm phần tương
+Tài liệu này mô tả trạng thái source tại mốc PR11, bao gồm phần tương
 thích với luồng PR10. Mục tiêu của PR11 là ingest tài liệu lớn theo từng
 document/window/batch, có manifest để resume, và chuyển generation vào alias
 đang được retrieval sử dụng chỉ sau khi đã kiểm tra tính toàn vẹn.
@@ -24,6 +24,10 @@ Alias ổn định cho retrieval là "child_chunks_active" và
 "parent_chunks_active". Collection vật lý của một generation có dạng
 "child_chunks_active__<generation-id>" và "parent_chunks_active__<generation-id>".
 Generation đang ghi không được dùng trực tiếp cho retrieval.
+
+Sau PR12/PR14, child schema có thêm native BM25 và dense 1024d; cần full
+backfill generation mới. Phần rollout queue, GPU services và migration hiện tại
+được cập nhật tại [docs/pr14-deployment.md](pr14-deployment.md).
 
 ## 2. Bảng liệt kê thay đổi source
 

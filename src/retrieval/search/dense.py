@@ -2,7 +2,7 @@
 Dense Search — Tìm kiếm bằng vector similarity (cosine).
 
 Cách hoạt động:
-  1. Embed query → vector 384d
+  1. Embed query → vector 1024d (BGE-M3 default)
   2. Tìm trong Qdrant: vectors nào gần nhất (cosine similarity)
   3. Trả về top-K kết quả
 
@@ -37,6 +37,7 @@ class DenseSearcher:
         top_k: int | None = None,
         *,
         scope: RetrievalScope | None = None,
+        collection_name: str | None = None,
     ) -> list[dict]:
         """Search bằng query text.
 
@@ -54,14 +55,17 @@ class DenseSearcher:
         query_vector = self.embedder.embed_single(query)
 
         # Search trong Qdrant
-        results = self.qdrant.search(
-            collection_name=settings.CHILD_COLLECTION,
-            query_vector=query_vector,
-            limit=top_k,
-            query_filter=scope.qdrant_filter(),
-        )
+        search_kwargs = {
+            "collection_name": collection_name or settings.CHILD_COLLECTION,
+            "query_vector": query_vector,
+            "limit": top_k,
+            "query_filter": scope.qdrant_filter(),
+        }
+        results = self.qdrant.search(**search_kwargs)
 
-        return self._format_results(results, scope=scope)
+        formatted = self._format_results(results, scope=scope)
+        logger.info("Retrieval metric", retrieval_mode="dense_only", result_count=len(formatted))
+        return formatted
 
     def search_by_vector(
         self,
@@ -69,24 +73,28 @@ class DenseSearcher:
         top_k: int | None = None,
         *,
         scope: RetrievalScope | None = None,
+        collection_name: str | None = None,
     ) -> list[dict]:
         """Search bằng vector có sẵn (dùng cho HyDE — đã embed sẵn).
 
         Args:
-            vector: Vector embedding 384d
+            vector: Vector embedding 1024d (BGE-M3 default)
             top_k: Số kết quả trả về
         """
         top_k = top_k or settings.TOP_K
         scope = scope or default_scope()
 
-        results = self.qdrant.search(
-            collection_name=settings.CHILD_COLLECTION,
-            query_vector=vector,
-            limit=top_k,
-            query_filter=scope.qdrant_filter(),
-        )
+        search_kwargs = {
+            "collection_name": collection_name or settings.CHILD_COLLECTION,
+            "query_vector": vector,
+            "limit": top_k,
+            "query_filter": scope.qdrant_filter(),
+        }
+        results = self.qdrant.search(**search_kwargs)
 
-        return self._format_results(results, scope=scope)
+        formatted = self._format_results(results, scope=scope)
+        logger.info("Retrieval metric", retrieval_mode="dense_only", result_count=len(formatted))
+        return formatted
 
     def _format_results(
         self,
@@ -107,9 +115,11 @@ class DenseSearcher:
                 "score": r.score,
                 "parent_id": payload.get("parent_id"),
                 "file_name": payload.get("file_name", ""),
+                "source_uri": payload.get("source_uri") or payload.get("source_path", ""),
                 "section_title": payload.get("section_title", ""),
                 "page_number": payload.get("page_number"),
                 "dataset_id": payload.get("dataset_id"),
+                "generation_id": payload.get("generation_id"),
                 "source": "dense",  # Đánh dấu nguồn tìm kiếm
             })
         return formatted
