@@ -4,7 +4,7 @@ UV := $(shell command -v uv 2>/dev/null || echo /Users/binh.dv/.local/bin/uv)
 # Bắt uv sync đồng bộ vào đúng môi trường rag/ (thay vì tạo .venv mặc định)
 export UV_PROJECT_ENVIRONMENT := rag
 
-.PHONY: help install install-dev local-start local-stop ingest ingest-sync ingest-load run-api run-ui evaluate test lint check clean
+.PHONY: help install install-dev local-start local-stop ingest ingest-sync ingest-load run-api run-worker run-ui evaluate test lint check clean
 
 help: ## Hiển thị danh sách lệnh
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -19,7 +19,7 @@ install: ## Cài đặt dependencies (uv sync --locked — đọc pyproject.toml
 install-dev: ## Cài đặt dependencies + dev deps (uv sync --locked — đọc pyproject.toml + uv.lock, đồng bộ vào rag/)
 	$(UV) sync --locked --extra dev
 
-local-start: ## Khởi động Qdrant (Docker)
+local-start: ## Khởi động Redis + Qdrant (Docker)
 	docker compose up -d
 
 local-stop: ## Dừng Docker
@@ -47,6 +47,9 @@ API_PORT ?= 8080          # ★ 8000 đang bị vLLM dùng — xem review PR 4 /
 
 run-api: ## Chạy FastAPI backend (mặc định 127.0.0.1:8080)
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m uvicorn api.main:app --host $(API_HOST) --port $(API_PORT) --reload
+
+run-worker: ## Chạy Redis Streams RAG worker (production mode)
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m workers.rag_worker
 
 run-ui: ## Chạy Gradio chat UI (port 7860)
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m api.ui

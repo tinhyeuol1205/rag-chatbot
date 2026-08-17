@@ -45,10 +45,10 @@ def test_dense_search_passes_scope_filter_and_rejects_out_of_scope_results():
 
 class _SparseQdrant:
     def __init__(self):
-        self.scroll_filter = None
+        self.query_filter = None
 
-    def scroll_all(self, _collection, *, scroll_filter):
-        self.scroll_filter = scroll_filter
+    def search_sparse(self, **kwargs):
+        self.query_filter = kwargs["query_filter"]
         # Simulate a backend/plugin that accidentally returns an extra point;
         # SparseSearcher must still apply the same defense-in-depth scope.
         return [
@@ -80,7 +80,7 @@ def test_sparse_index_is_scoped_and_legacy_points_are_excluded():
 
     assert all(result["dataset_id"] == "team_a" for result in results)
     assert {result["chunk_id"] for result in results} <= {"a1", "a2"}
-    assert searcher.qdrant.scroll_filter.must[0].key == "dataset_id"
+    assert searcher.qdrant.query_filter.must[0].key == "dataset_id"
 
 
 class _ParentQdrant:

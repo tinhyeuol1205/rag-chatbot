@@ -43,9 +43,10 @@ User Query                               │
 | Component | Technology |
 |---|---|
 | LLM | OpenAI-compatible (OpenAI / NVIDIA NIM / vLLM) **hoặc** Google Gemini |
-| Embeddings | `BAAI/bge-small-en-v1.5` (local, free) |
-| Reranker | `BAAI/bge-reranker-v2-m3` (local, free) |
-| Vector DB | Qdrant |
+| Embeddings | `BAAI/bge-m3` (1024d, self-host GPU in production) |
+| Reranker | `BAAI/bge-reranker-v2-m3` (self-host GPU in production) |
+| Vector DB | Qdrant (native BM25 + dense RRF) |
+| Admission | Redis Streams + atomic 15 calls/minute reservation |
 | Backend | FastAPI + SSE streaming |
 | Frontend | Gradio |
 | Evaluation | RAGAS (RAG Triad metrics) |
@@ -62,20 +63,25 @@ cd rag-chatbot
 cp .env.example .env          # Chọn LLM_PROVIDER + điền API key
 make install-dev              # hoặc make install
 
-# 2. Start Qdrant (Docker)
+# 2. Start Redis + Qdrant (Docker)
 make local-start
 
 # 3. Ingest sample documents
 make ingest
 
-# 4a. Start API backend (FastAPI, port 8080)
+# 4a. Start API backend (FastAPI, port 8080; inline dev mode)
 make run-api
 
 # 4b. Start chatbot UI (Gradio, port 7860)
 make run-ui
+
+# Production: set RAG_EXECUTION_MODE=redis_worker and run the worker separately
+make run-worker
 ```
 
-**Ghi chú:** UI (`run-ui`) gọi retriever **trực tiếp trong process** (không qua FastAPI). API (`run-api`) dành cho client riêng qua HTTP/SSE.
+**Ghi chú:** production API/worker dùng Redis admission; chỉ worker sau khi
+reserve quota mới chạy embedding → Qdrant → reranking → LLM. `inline` là adapter
+dev/test và không tạo backlog phân tán.
 
 ## 📁 Project Structure
 
@@ -85,7 +91,7 @@ src/
 ├── ingestion/              # Parse → Chunk → Embed → Store pipeline
 │   ├── parsers/            # PDF, Markdown, DOCX parsers (Strategy pattern)
 │   ├── chunking/           # Recursive + Parent-Child chunking
-│   ├── embeddings.py       # bge-small-en embedding service
+│   ├── embeddings.py       # BGE-M3 local adapter / GPU HTTP client
 │   ├── batching.py          # point/byte bounded request batches
 │   ├── manifest.py          # SQLite source manifest + checkpoints
 │   └── pipeline.py         # Orchestrator
@@ -96,7 +102,8 @@ src/
 │   ├── context/            # Parent resolution + Lost-in-Middle
 │   └── retriever.py        # Main orchestrator
 ├── evaluation/             # RAGAS evaluation pipeline
-└── api/                    # FastAPI backend + Gradio UI
+├── api/                    # FastAPI backend + Gradio UI
+└── workers/                # Redis Streams RAG worker
 ```
 
 ## 📊 Evaluation
@@ -163,7 +170,8 @@ theo mặc định để tránh xóa nhầm khi volume mount sai; chỉ dùng
 `python -m ingestion.main --sync --allow-empty-source` khi đã xác minh nguồn.
 Dùng `--dry-run` để xem kế hoạch trước khi mutate. Ingestion có file lỗi sẽ ghi
 summary JSON và trả exit code khác 0 để scheduler/CI không đánh dấu job thành công.
-Sau khi ingest ở terminal khác, restart server để BM25 index rebuild (xem Limitations).
+PR14 dùng native BM25 trong Qdrant nên generation mới thấy được ngay sau alias
+switch, không cần restart API để rebuild sparse index.
 
 Sau khi nâng cấp từ dữ liệu trước PR 8, cần đặt `INGEST_DATASET_ID` rồi chạy full
 `make ingest` một lần để tạo payload/IDs mới. Legacy points thiếu `dataset_id` không
@@ -199,15 +207,20 @@ PY
 Các generation đã commit cũ hơn `INGEST_GENERATION_RETENTION` sẽ được dọn sau
 khi activation thành công; generation lỗi vẫn được giữ để điều tra.
 
-Xem bảng thay đổi source và hướng dẫn dev/test, backfill, load test, rollback:
-[docs/pr11-changes-and-deployment.md](docs/pr11-changes-and-deployment.md).
+Xem bảng thay đổi PR11 tại
+[docs/pr11-changes-and-deployment.md](docs/pr11-changes-and-deployment.md) và
+runbook triển khai PR14 tại
+[docs/pr14-deployment.md](docs/pr14-deployment.md).
 
 ## 🗺️ Port Map
 
 | Service | Port | Ghi chú |
 |---|---|---|
 | Qdrant | 6333 / 6334 | docker-compose |
+| Redis | 6379 | Streams admission + rate reservations |
 | LLM server (vLLM / NIM) | 8000 | trỏ bởi `OPENAI_BASE_URL` |
+| Embedding GPU service | 8080 | `EMBEDDING_BASE_URL`, BGE-M3 |
+| Reranker GPU service | 8080 | `RERANKER_BASE_URL`, BGE-Reranker-v2-m3 |
 | FastAPI backend | 8080 | `make run-api` |
 | Gradio UI | 7860 | `make run-ui` |
 
@@ -216,14 +229,18 @@ Xem bảng thay đổi source và hướng dẫn dev/test, backfill, load test, 
 - **Ngôn ngữ:** BM25 tokenizer hỗ trợ Unicode — hoạt động tốt với ngôn ngữ có dấu
   cách phân từ (Anh, Việt kể cả chữ có dấu). CJK (Trung/Nhật/Hàn) chưa hỗ trợ —
   cần tokenizer riêng. Dense search thì đa ngôn ngữ bình thường.
-- **Latency:** trên CPU, mỗi câu hỏi mất vài giây đến vài chục giây (2 LLM call +
-  cross-encoder rerank). Xem `RERANKER_MODEL_ID` trong `.env` để đổi sang model nhẹ hơn.
+- **Latency:** mỗi câu hỏi có thể dùng tối đa 4 LLM calls (condense khi có history,
+  Multi-Query, HyDE và final) cùng cross-encoder rerank; GPU services và Redis
+  reservation giúp giới hạn tải nhưng SLO vẫn phải đo trên corpus thật.
 - **Multi-turn:** hỗ trợ cơ bản qua Query Condensation (viết lại follow-up thành câu hỏi
   độc lập). Giới hạn: chỉ nhìn 3 lượt gần nhất, tốn thêm 1 LLM call mỗi câu hỏi có history.
-- **BM25 index:** build 1 lần trong process. Ingestion generation mới sẽ invalidate
-  cache local; nếu ingest ở process khác, restart server để BM25 thấy dữ liệu mới.
-- **Scale:** ingestion đã giới hạn memory theo file/window và batch/byte budget. BM25
-  vẫn giữ toàn bộ corpus trong RAM; retrieval lớn hơn khoảng 100k chunk cần PR12.
+- **Hybrid index:** dense + native BM25 chạy và fuse server-side trong Qdrant,
+  dùng cùng dataset filter; API không còn load corpus vào RAM hay cần restart
+  để refresh sparse index.
+- **Scale:** Redis queue được bound bởi `RAG_QUEUE_MAX_OUTSTANDING`; quota LLM
+  được reserve atomically trước pipeline (mặc định 15 calls/60s). Context vẫn
+  dùng character cap `MAX_CONTEXT_CHARS` của baseline, không có tokenizer/budget
+  accounting trong PR14.
 - **Provider Gemini:** đã smoke-test end-to-end với `google-genai 2.15.0`
   (Interactions API, model `gemini-2.5-flash`) — xem `review/standalone.md` P0-2.
 

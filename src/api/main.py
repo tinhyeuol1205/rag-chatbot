@@ -12,15 +12,18 @@ Hoặc:      uvicorn api.main:app --host 127.0.0.1 --port 8080 --reload
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from secrets import compare_digest
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
+from qdrant_client.models import Distance
 from sse_starlette.sse import EventSourceResponse
-from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
+from starlette.concurrency import run_in_threadpool
 
 from api.chat import (
     USER_FACING_ERROR,
@@ -29,9 +32,10 @@ from api.chat import (
     get_retriever,
 )
 from core import get_logger
+from core.admission_queue import InlineAdmissionQueue, get_admission_queue
 from core.config import settings
 from core.db import QdrantConnector
-from core.errors import RAGChatbotError
+from core.errors import JobTimeoutError, QueueFullError, QueueUnavailableError, RAGChatbotError
 
 logger = get_logger(__name__)
 
@@ -77,7 +81,7 @@ app.add_middleware(
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-API-Key"],
+    allow_headers=["Content-Type", "X-API-Key", "Idempotency-Key"],
 )
 
 
@@ -101,6 +105,102 @@ class ChatResponse(BaseModel):
     sources: list[SourceResponse] = Field(default_factory=list)
 
 
+def _run_chat_job(query: str, history: list[tuple[str, str]]) -> object:
+    try:
+        return chat_or_raise_with_sources(query, history=history)
+    except TypeError as exc:
+        # Keep small test/integration adapters written against the PR11
+        # one-argument contract working without swallowing real TypeErrors
+        # raised inside the chat implementation.
+        if "unexpected keyword argument 'history'" not in str(exc):
+            raise
+        return chat_or_raise_with_sources(query)
+
+
+def _run_stream_job(query: str, history: list[tuple[str, str]]) -> list:
+    try:
+        return list(chat_stream_events(query, history=history))
+    except TypeError as exc:
+        if "unexpected keyword argument 'history'" not in str(exc):
+            raise
+        return list(chat_stream_events(query))
+
+
+def _result_from_payload(payload: object):
+    """Restore a worker JSON result without coupling Redis to API models."""
+    from retrieval.context.assembler import SourceRef
+    from retrieval.retriever import RAGResult
+
+    if isinstance(payload, RAGResult):
+        return payload
+    data = payload if isinstance(payload, dict) else {}
+    return RAGResult(
+        answer=str(data.get("answer", "")),
+        contexts=list(data.get("contexts", []) or []),
+        sources=[SourceRef(**source) for source in data.get("sources", []) or []],
+        expanded_queries=list(data.get("expanded_queries", []) or []),
+        num_candidates=int(data.get("num_candidates", 0)),
+    )
+
+
+async def _submit_chat(
+    query: str,
+    history: list[tuple[str, str]] | None = None,
+    idempotency_key: str | None = None,
+):
+    queue = get_admission_queue()
+    history = history or []
+    if isinstance(queue, InlineAdmissionQueue):
+        payload = await asyncio.to_thread(queue.execute, _run_chat_job, query, history)
+    else:
+        if idempotency_key is None:
+            job = await asyncio.to_thread(queue.enqueue, query, history)
+        else:
+            job = await asyncio.to_thread(
+                queue.enqueue,
+                query,
+                history,
+                idempotency_key=idempotency_key,
+            )
+        try:
+            payload = await asyncio.to_thread(queue.wait_result, job.job_id, settings.RAG_JOB_MAX_WAIT_SECONDS)
+        except JobTimeoutError:
+            # If the worker has not started yet this atomically releases the
+            # outstanding slot and prevents a late GPU/LLM charge.  A running
+            # job only receives a cancellation request and is not retried.
+            await asyncio.to_thread(queue.cancel, job.job_id)
+            raise
+        except asyncio.CancelledError:
+            await asyncio.to_thread(queue.cancel, job.job_id)
+            raise
+    return _result_from_payload(payload)
+
+
+def _normalise_event(item):
+    if isinstance(item, str):
+        event_name, data = "token", item
+    else:
+        event_name = str(item.get("event", "token"))
+        data = item.get("data", "")
+    if event_name == "token" and isinstance(data, str):
+        data = {"text": data}
+    elif event_name == "sources" and isinstance(data, list):
+        data = {"sources": data}
+    elif event_name == "end":
+        data = {}
+    elif isinstance(data, str):
+        data = {"message": data}
+    return event_name, data
+
+
+def _result_events(result) -> list[dict]:
+    return [
+        {"event": "token", "data": result.answer},
+        {"event": "sources", "data": [source.as_dict() for source in result.sources]},
+        {"event": "end", "data": {}},
+    ]
+
+
 # --- Endpoints ---
 
 @app.get("/health")
@@ -109,24 +209,90 @@ async def health_check():
     return {"status": "ok"}
 
 
+@app.get("/ready")
+async def readiness_check():
+    """Readiness for Redis admission, GPU services and the active Qdrant schema."""
+    try:
+        if settings.RAG_EXECUTION_MODE == "redis_worker":
+            queue = get_admission_queue()
+            queue.client.ping()
+        connector = QdrantConnector()
+        child = connector.alias_target(settings.CHILD_COLLECTION)
+        parent = connector.alias_target(settings.PARENT_COLLECTION)
+        if not child or not parent:
+            raise ValueError("active aliases are missing")
+        connector.validate_collection_schema(
+            child,
+            schema_fingerprint=None,
+            vector_dimension=settings.EMBEDDING_SIZE,
+            expected_distance=Distance.COSINE,
+            require_sparse=True,
+        )
+        if settings.EMBEDDING_RUNTIME == "remote":
+            response = await asyncio.to_thread(
+                httpx.get,
+                settings.EMBEDDING_BASE_URL.rstrip("/") + "/health",
+                timeout=settings.EMBEDDING_HTTP_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+        if settings.RERANKER_RUNTIME == "remote":
+            response = await asyncio.to_thread(
+                httpx.get,
+                settings.RERANKER_BASE_URL.rstrip("/") + "/health",
+                timeout=settings.RERANKER_HTTP_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+    except Exception as exc:
+        logger.warning("Readiness check failed", error_type=type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "not_ready", "message": "Hệ thống chưa sẵn sàng phục vụ"},
+        ) from exc
+    return {"status": "ready", "child_collection": child, "parent_collection": parent}
+
+
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
-def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(
+    request: ChatRequest,
+    idempotency_key: str | None = Header(default=None, max_length=128, alias="Idempotency-Key"),
+):
     """Chat endpoint — trả về JSON response đầy đủ.
 
-    KHÔNG dùng async def: chat() là sync nặng (LLM + inference CPU).
-    Để FastAPI đẩy vào threadpool thay vì block event loop (bug P0-3).
+    Chỉ enqueue/wait ở API; worker mới chạy RAG sau Redis admission.
     """
     try:
-        result = chat_or_raise_with_sources(request.query)
+        result = await _submit_chat(request.query, idempotency_key=idempotency_key)
         return ChatResponse(
             answer=result.answer,
             sources=[SourceResponse(**source.as_dict()) for source in result.sources],
         )
+    except QueueFullError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={"code": exc.error_code, "message": exc.public_message},
+            headers={"Retry-After": "1"},
+        ) from exc
+    except QueueUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": exc.error_code, "message": exc.public_message},
+        ) from exc
+    except JobTimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail={"code": exc.error_code, "message": exc.public_message},
+        ) from exc
     except RAGChatbotError as exc:
         logger.exception("Known error in /chat", error_code=exc.error_code)
         raise HTTPException(
             status_code=503,
             detail={"code": exc.error_code, "message": exc.public_message},
+        ) from exc
+    except (ConnectionError, TimeoutError) as exc:
+        logger.exception("Inference or provider transport unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "upstream_unavailable", "message": USER_FACING_ERROR},
         ) from exc
     except Exception:
         logger.exception("Unhandled error in /chat")
@@ -134,43 +300,96 @@ def chat_endpoint(request: ChatRequest):
 
 
 @app.post("/chat/stream", dependencies=[Depends(require_api_key)])
-async def chat_stream_endpoint(request: ChatRequest):
+async def chat_stream_endpoint(
+    request: ChatRequest,
+    idempotency_key: str | None = Header(default=None, max_length=128, alias="Idempotency-Key"),
+):
     """Chat streaming endpoint — trả về SSE (Server-Sent Events).
 
     Lưu ý: retrieval pipeline (multi-query + HyDE + search + rerank) chạy TRƯỚC
     token đầu tiên, nên TTFT ≈ thời gian retrieval (vài giây), không phải < 500ms.
     Event "status" được gửi ngay để client biết request đã được nhận.
     """
-    async def generate():
-        yield {
-            "event": "status",
-            "data": json.dumps(
-                {"message": "Đang tìm kiếm tài liệu..."},
-                ensure_ascii=False,
-            ),
-        }
-        # iterate_in_threadpool: sync generator chạy trong thread, không block loop.
-        async for item in iterate_in_threadpool(chat_stream_events(request.query)):
-            # Backward-compatible với generator test/caller cũ chỉ yield string.
-            if isinstance(item, str):
-                event_name, data = "token", item
+    queue = get_admission_queue()
+    pending_job = None
+    if not isinstance(queue, InlineAdmissionQueue):
+        try:
+            if idempotency_key is None:
+                pending_job = await asyncio.to_thread(queue.enqueue, request.query, [])
             else:
-                event_name = str(item.get("event", "token"))
-                data = item.get("data", "")
+                pending_job = await asyncio.to_thread(
+                    queue.enqueue,
+                    request.query,
+                    [],
+                    idempotency_key=idempotency_key,
+                )
+        except QueueFullError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={"code": exc.error_code, "message": exc.public_message},
+                headers={"Retry-After": "1"},
+            ) from exc
+        except QueueUnavailableError as exc:
+            raise HTTPException(status_code=503, detail={"code": exc.error_code, "message": exc.public_message}) from exc
 
-            if event_name == "token" and isinstance(data, str):
-                data = {"text": data}
-            elif event_name == "sources" and isinstance(data, list):
-                data = {"sources": data}
-            elif event_name == "end":
-                data = {}
-            elif isinstance(data, str):
-                # Preserve custom event payloads while keeping the SSE contract JSON.
-                data = {"message": data}
+    async def generate():
+        try:
             yield {
-                "event": event_name,
-                "data": json.dumps(data, ensure_ascii=False),
+                "event": "status",
+                "data": json.dumps(
+                    {"message": "Đang tìm kiếm tài liệu..."},
+                    ensure_ascii=False,
+                ),
             }
-        yield {"event": "end", "data": "{}"}     # tín hiệu kết thúc cho client
+            if isinstance(queue, InlineAdmissionQueue):
+                events = await asyncio.to_thread(
+                    queue.execute,
+                    _run_stream_job,
+                    request.query,
+                    [],
+                )
+            else:
+                try:
+                    payload = await asyncio.to_thread(queue.wait_result, pending_job.job_id, settings.RAG_JOB_MAX_WAIT_SECONDS)
+                except JobTimeoutError:
+                    await asyncio.to_thread(queue.cancel, pending_job.job_id)
+                    raise
+                events = _result_events(_result_from_payload(payload))
+            for item in events:
+                event_name, data = _normalise_event(item)
+                yield {
+                    "event": event_name,
+                    "data": json.dumps(data, ensure_ascii=False),
+                }
+            last_event = events[-1] if events else None
+            if not isinstance(last_event, dict) or last_event.get("event") != "end":
+                yield {"event": "end", "data": "{}"}
+        except RAGChatbotError as exc:
+            yield {
+                "event": "error",
+                "data": json.dumps(
+                    {"code": exc.error_code, "message": exc.public_message},
+                    ensure_ascii=False,
+                ),
+            }
+            yield {"event": "end", "data": "{}"}
+        except Exception:
+            logger.exception("Unhandled error in /chat/stream")
+            yield {
+                "event": "error",
+                "data": json.dumps(
+                    {"code": "internal_error", "message": USER_FACING_ERROR},
+                    ensure_ascii=False,
+                ),
+            }
+            yield {"event": "end", "data": "{}"}
+        finally:
+            # Closing a client-side SSE generator before the first worker poll
+            # must not leave an outstanding Redis job behind.
+            if pending_job is not None:
+                try:
+                    await asyncio.to_thread(queue.cancel, pending_job.job_id)
+                except Exception:  # noqa: BLE001 - cleanup must not mask disconnect
+                    logger.warning("Failed to cancel disconnected RAG job")
 
-    return EventSourceResponse(generate())
+    return EventSourceResponse(generate(), send_timeout=settings.SSE_SEND_TIMEOUT_SECONDS)

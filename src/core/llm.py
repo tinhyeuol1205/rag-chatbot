@@ -25,6 +25,7 @@ from abc import ABC, abstractmethod
 from threading import Lock
 
 from core import get_logger
+from core.admission_queue import consume_llm_permit
 from core.config import settings
 from core.errors import ConfigurationError
 
@@ -61,7 +62,7 @@ class OpenAILLMService(BaseLLMService):
     def __init__(self):
         from openai import OpenAI
 
-        kwargs = {"api_key": settings.OPENAI_API_KEY}
+        kwargs = {"api_key": settings.OPENAI_API_KEY, "max_retries": 0, "timeout": settings.LLM_HTTP_TIMEOUT_SECONDS}
         if settings.OPENAI_BASE_URL:
             kwargs["base_url"] = settings.OPENAI_BASE_URL
 
@@ -81,6 +82,7 @@ class OpenAILLMService(BaseLLMService):
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_prompt})
 
+        consume_llm_permit()
         response = self._client.chat.completions.create(
             model=self._model,
             messages=messages,
@@ -112,6 +114,7 @@ class OpenAILLMService(BaseLLMService):
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_prompt})
 
+        consume_llm_permit()
         stream = self._client.chat.completions.create(
             model=self._model,
             messages=messages,
@@ -119,12 +122,17 @@ class OpenAILLMService(BaseLLMService):
             max_tokens=max_tokens,
             stream=True,
         )
-        for chunk in stream:
-            if not chunk.choices:  # usage-only chunk → bỏ qua (vLLM/NIM/Azure)
-                continue
-            delta = chunk.choices[0].delta
-            if delta and delta.content:
-                yield delta.content
+        try:
+            for chunk in stream:
+                if not chunk.choices:  # usage-only chunk → bỏ qua (vLLM/NIM/Azure)
+                    continue
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
 
 
 class GeminiLLMService(BaseLLMService):
@@ -141,11 +149,16 @@ class GeminiLLMService(BaseLLMService):
 
     def __init__(self):
         from google import genai
+        from google.genai import types
 
         kwargs = {}
         if settings.GEMINI_API_KEY:
             kwargs["api_key"] = settings.GEMINI_API_KEY
 
+        kwargs["http_options"] = types.HttpOptions(
+            timeout=int(settings.LLM_HTTP_TIMEOUT_SECONDS * 1000),
+            retry_options=types.HttpRetryOptions(attempts=1),
+        )
         self._client = genai.Client(**kwargs)
         self._model = settings.GEMINI_MODEL_ID
         logger.info("Gemini LLM initialized", model=self._model)
@@ -171,6 +184,7 @@ class GeminiLLMService(BaseLLMService):
         if system_prompt:
             kwargs["system_instruction"] = system_prompt
 
+        consume_llm_permit()
         interaction = self._client.interactions.create(**kwargs)
         return (interaction.output_text or "").strip()
 
@@ -195,14 +209,20 @@ class GeminiLLMService(BaseLLMService):
         if system_prompt:
             kwargs["system_instruction"] = system_prompt
 
+        consume_llm_permit()
         stream = self._client.interactions.create(**kwargs)
-        for event in stream:
-            if (
-                event.event_type == "step.delta"
-                and event.delta.type == "text"
-                and event.delta.text
-            ):
-                yield event.delta.text
+        try:
+            for event in stream:
+                if (
+                    event.event_type == "step.delta"
+                    and event.delta.type == "text"
+                    and event.delta.text
+                ):
+                    yield event.delta.text
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
 
 
 # ================================================================

@@ -1,22 +1,4 @@
-"""
-Embedding Service — Chuyển text thành vector (384 dimensions).
-
-Model: BAAI/bge-small-en-v1.5
-- Chạy LOCAL (không tốn API tiền)
-- 384 dimensions (nhỏ, nhanh, phù hợp demo)
-- Chất lượng tốt trên MTEB benchmark
-
-Tại sao không dùng OpenAI Embeddings?
-- OpenAI tốn tiền cho mỗi lần embed
-- bge-small-en chạy local, miễn phí, đủ chất lượng
-- Trong production thật có thể switch sang OpenAI text-embedding-3-small
-
-Usage:
-    from ingestion.embeddings import EmbeddingService
-    service = EmbeddingService()
-    vectors = service.embed(["Hello world", "Another text"])
-    # vectors.shape = (2, 384)
-"""
+"""Embedding service for BGE-M3 local/dev and remote GPU production modes."""
 
 from __future__ import annotations
 
@@ -25,6 +7,7 @@ import time
 from collections.abc import Iterable, Iterator
 from threading import Lock
 
+import httpx
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
@@ -48,8 +31,9 @@ def _load_model() -> SentenceTransformer:
             if _embedding_model is None:    # double-check LẠI sau khi có lock
                 logger.info("Loading embedding model", model=settings.EMBEDDING_MODEL_ID)
                 kwargs = {"device": settings.EMBEDDING_DEVICE}
-                if settings.INGEST_EMBEDDING_MODEL_REVISION:
-                    kwargs["revision"] = settings.INGEST_EMBEDDING_MODEL_REVISION
+                revision = settings.EMBEDDING_MODEL_REVISION or settings.INGEST_EMBEDDING_MODEL_REVISION
+                if revision:
+                    kwargs["revision"] = revision
                 model = SentenceTransformer(settings.EMBEDDING_MODEL_ID, **kwargs)
                 dimensions = getattr(model, "get_sentence_embedding_dimension", lambda: settings.EMBEDDING_SIZE)()
                 if dimensions is not None and dimensions != settings.EMBEDDING_SIZE:
@@ -63,18 +47,28 @@ def _load_model() -> SentenceTransformer:
 
 
 class EmbeddingService:
-    """Wrapper mỏng quanh model đã cache ở module level.
+    """One contract for ingestion and online query embedding.
 
-    Tạo bao nhiêu instance cũng chỉ load model 1 lần (cache nằm ở _load_model).
+    Production uses an HTTP GPU service so API/worker replicas do not each load
+    BGE-M3 weights.  The local SentenceTransformer adapter remains available for
+    development and deterministic unit tests.
     """
 
     @property
+    def is_remote(self) -> bool:
+        return settings.EMBEDDING_RUNTIME == "remote"
+
+    @property
     def model(self) -> SentenceTransformer:
+        if self.is_remote:
+            raise RuntimeError("Remote embedding runtime does not expose an in-process model")
         return _load_model()
 
     @property
     def dimension(self) -> int:
         """Resolve the model dimension before a collection can be mutated."""
+        if self.is_remote:
+            return settings.EMBEDDING_SIZE
         dimension_fn = getattr(self.model, "get_sentence_embedding_dimension", None)
         if dimension_fn is None:
             return settings.EMBEDDING_SIZE
@@ -95,10 +89,12 @@ class EmbeddingService:
             texts: Danh sách strings cần embed
 
         Returns:
-            List of vectors, mỗi vector có EMBEDDING_SIZE dimensions (384)
+            List of vectors, mỗi vector có EMBEDDING_SIZE dimensions (1024 for BGE-M3)
         """
         if not texts:
             return []
+        if self.is_remote:
+            return self._embed_remote(texts)
         vectors = self._encode_with_retry(texts)
         array = np.asarray(vectors, dtype=np.float32)
         if array.ndim != 2 or array.shape[1] != self.dimension:
@@ -136,6 +132,8 @@ class EmbeddingService:
         return self.embed([text])[0]
 
     def _encode_batch(self, texts: list[str]) -> np.ndarray:
+        if self.is_remote:
+            return np.asarray(self._embed_remote(texts), dtype=np.float32)
         vectors = self._encode_with_retry(texts)
         array = np.asarray(vectors, dtype=np.float32)
         if array.ndim != 2 or array.shape[1] != self.dimension:
@@ -153,7 +151,7 @@ class EmbeddingService:
                 return self.model.encode(
                     texts,
                     show_progress_bar=False,
-                    normalize_embeddings=True,
+                    normalize_embeddings=settings.EMBEDDING_NORMALIZE,
                     batch_size=min(len(texts), settings.INGEST_EMBED_BATCH_SIZE),
                     convert_to_numpy=True,
                 )
@@ -175,3 +173,34 @@ class EmbeddingService:
                     error_type=type(exc).__name__,
                 )
                 time.sleep(delay)
+
+    def _embed_remote(self, texts: list[str]) -> list[list[float]]:
+        """Call the pinned GPU embedding service contract.
+
+        Accepted response shapes are the common TEI-style list of vectors and
+        ``{"embeddings": [...]}``; anything else fails closed before Qdrant.
+        """
+        url = settings.EMBEDDING_BASE_URL.rstrip("/") + "/embed"
+        payload = {
+            "inputs": texts,
+            "model": settings.EMBEDDING_MODEL_ID,
+            "revision": settings.EMBEDDING_MODEL_REVISION or settings.INGEST_EMBEDDING_MODEL_REVISION,
+            "normalize": settings.EMBEDDING_NORMALIZE,
+        }
+        try:
+            response = httpx.post(url, json=payload, timeout=settings.EMBEDDING_HTTP_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            body = response.json()
+        except Exception as exc:
+            logger.warning("Remote embedding service failed", error_type=type(exc).__name__)
+            raise ConnectionError("Embedding service unavailable") from exc
+        vectors = body.get("embeddings") if isinstance(body, dict) else body
+        if not isinstance(vectors, list) or len(vectors) != len(texts):
+            raise ValueError("Embedding service returned an invalid batch cardinality")
+        array = np.asarray(vectors, dtype=np.float32)
+        if array.ndim != 2 or array.shape[1] != settings.EMBEDDING_SIZE:
+            raise ValueError(
+                "Embedding service returned an unexpected dimension: "
+                f"got={array.shape}, expected=(*, {settings.EMBEDDING_SIZE})"
+            )
+        return array.tolist()

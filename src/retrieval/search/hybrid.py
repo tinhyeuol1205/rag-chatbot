@@ -36,7 +36,7 @@ from core import get_logger
 from core.config import settings
 from retrieval.scope import RetrievalScope, default_scope
 from retrieval.search.dense import DenseSearcher
-from retrieval.search.sparse import SparseSearcher
+from retrieval.search.sparse import SparseSearcher, format_results, sparse_document
 
 logger = get_logger(__name__)
 
@@ -59,6 +59,7 @@ class HybridSearcher:
         *,
         scope: RetrievalScope | None = None,
         include_sparse: bool = True,
+        collection_name: str | None = None,
     ) -> list[dict]:
         """Hybrid search: Dense + Sparse + RRF fusion.
 
@@ -73,37 +74,47 @@ class HybridSearcher:
         top_k = top_k or settings.TOP_K
         scope = scope or default_scope()
 
-        # --- Bước 1: Chạy song song 2 search engines ---
+        if hyde_vector is not None:
+            dense_vector = hyde_vector
+        else:
+            dense_vector = self.dense.embedder.embed_single(query)
 
-        # Dense: dùng HyDE vector nếu có, nếu không thì embed query
-        if hyde_vector:
-            dense_results = self.dense.search_by_vector(
-                hyde_vector,
+        if include_sparse:
+            raw_results = self.dense.qdrant.search_hybrid(
+                collection_name or settings.CHILD_COLLECTION,
+                dense_vector=dense_vector,
+                sparse_query=sparse_document(query),
+                sparse_vector_name=settings.QDRANT_SPARSE_VECTOR_NAME,
+                limit=top_k,
+                prefetch_limit=max(settings.QDRANT_HYBRID_PREFETCH_LIMIT, top_k),
+                query_filter=scope.qdrant_filter(),
+            )
+            final = format_results(raw_results, scope=scope)
+            for result in final:
+                result["source"] = "hybrid"
+                result["rrf_score"] = result["score"]
+                result["n_hits"] = 1
+            dense_count = sparse_count = len(final)
+        else:
+            final = self.dense.search_by_vector(
+                dense_vector,
                 top_k=top_k,
                 scope=scope,
+                collection_name=collection_name,
             )
-        else:
-            dense_results = self.dense.search(query, top_k=top_k, scope=scope)
-
-        # Sparse: BM25 keyword search
-        sparse_results = (
-            self.sparse.search(query, top_k=top_k, scope=scope)
-            if include_sparse
-            else []
-        )
-
-        # --- Bước 2: RRF Fusion ---
-        merged = self._rrf_fusion(dense_results, sparse_results)
-
-        # --- Bước 3: Lấy top-K ---
-        final = merged[:top_k]
+            dense_count, sparse_count = len(final), 0
 
         logger.info(
             "Hybrid search done",
-            dense_count=len(dense_results),
-            sparse_count=len(sparse_results),
-            merged_count=len(merged),
+            dense_count=dense_count,
+            sparse_count=sparse_count,
+            merged_count=len(final),
             final_count=len(final),
+        )
+        logger.info(
+            "Retrieval metric",
+            retrieval_mode="fused" if include_sparse else "dense_only",
+            result_count=len(final),
         )
 
         return final

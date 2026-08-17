@@ -1,4 +1,21 @@
 services:
+  redis:
+    # Streams + Lua scripts require a real Redis server (not an in-process
+    # substitute).  Pin the major/minor image for reproducible local tests.
+    image: redis:7.4.2-alpine
+    container_name: rag-chatbot-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: always
+
   qdrant:
     # Pin version đã smoke-test với qdrant-client 1.19.0 (P3-9 — tránh `latest`
     # thay đổi ngầm giữa local/runtime, mất reproducibility).
@@ -12,4 +29,5 @@ services:
     restart: always
 
 volumes:
+  redis-data:
   qdrant-data:

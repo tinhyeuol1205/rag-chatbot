@@ -1,78 +1,105 @@
-"""
-Sparse Search (BM25) — Tìm kiếm bằng từ khóa.
+"""Qdrant-native BM25 helpers.
 
-BM25 là thuật toán "cổ điển" dùng trong search engines (Google, Elasticsearch).
-Nó đếm TẦN SUẤT từ khóa xuất hiện trong document, có điều chỉnh theo:
-  - TF (Term Frequency): Từ xuất hiện nhiều lần trong doc → điểm cao
-  - IDF (Inverse Document Frequency): Từ hiếm (chỉ xuất hiện ở ít docs) → quan trọng hơn
-  - Document length normalization: Doc ngắn match 1 từ → quan trọng hơn doc dài match 1 từ
-
-Ưu điểm: Chính xác với từ khóa, mã sản phẩm, tên riêng
-  "TC-456" → BM25 tìm CHÍNH XÁC document chứa "TC-456" (kể cả khi dính dấu câu)
-
-Nhược điểm: Không hiểu ngữ nghĩa
-  "xe hơi" ≠ "ô tô" → BM25 coi là 2 từ KHÁC NHAU
-
-Giới hạn: chỉ hoạt động tốt với ngôn ngữ có space phân từ (Anh, Việt có dấu cách).
-  CJK (Trung/Nhật/Hàn) cần tokenizer riêng — chưa hỗ trợ.
-
-Tham khảo: rag_master.md — Module 3, mục 3.1 (Sparse Embeddings)
+Sparse text is indexed by Qdrant during ingestion and searched on the server.
+The API process therefore never scrolls, tokenizes, or scores the full corpus.
 """
 
 from __future__ import annotations
 
-import heapq
 import re
 import unicodedata
-from threading import Lock
 
-from rank_bm25 import BM25Okapi
+from qdrant_client.models import (
+    Bm25Config,
+    Document,
+    TokenizerType,
+)
 
 from core import get_logger
 from core.config import settings
 from core.db import QdrantConnector
-from core.errors import RetrievalError
 from retrieval.scope import RetrievalScope, default_scope
 
 logger = get_logger(__name__)
 
-# Index được chia sẻ ở module level: tạo bao nhiêu instance cũng chỉ build 1 lần
-# cho mỗi authorized scope.  Gọi invalidate_bm25_index() sau khi ingest để nạp lại.
-_index_lock = Lock()
-_index_cache: dict[tuple[str, ...], tuple[BM25Okapi | None, list[dict]]] = {}
-_index_version = 0
-
-# Tokenizer giữ được mã kiểu 'TC-456' kể cả khi dính dấu câu:
-#   "see TC-456."    → ['tc-456']
-#   "(TC-456), done" → ['tc-456', 'done']
 _TOKEN_RE = re.compile(r"[^\W_]+(?:[-_][^\W_]+)*", re.UNICODE)
 
 
 def tokenize(text: str) -> list[str]:
-    """NFKC + casefold + tokenize Unicode, giữ mã nối bằng '-' hoặc '_'."""
+    """Compatibility/debug tokenizer; online ranking is performed by Qdrant."""
     normalized = unicodedata.normalize("NFKC", text).casefold()
     return _TOKEN_RE.findall(normalized)
 
 
-def invalidate_bm25_index() -> None:
-    """Gọi sau khi ingest xong để BM25 nạp lại corpus (bug P1-9a).
+def _tokenizer() -> TokenizerType:
+    """Resolve an explicitly configured Qdrant tokenizer."""
+    try:
+        return TokenizerType(settings.QDRANT_SPARSE_TOKENIZER.lower())
+    except ValueError as exc:
+        raise ValueError(
+            f"Unsupported QDRANT_SPARSE_TOKENIZER: {settings.QDRANT_SPARSE_TOKENIZER}"
+        ) from exc
 
-    Lưu ý: chỉ có tác dụng trong CÙNG process. Nếu ingest ở terminal khác với
-    server đang chạy → vẫn phải restart server để BM25 thấy dữ liệu mới.
-    """
-    global _index_version
-    with _index_lock:
-        _index_cache.clear()
-        _index_version += 1
-    logger.info("BM25 index invalidated", version=_index_version)
+
+def bm25_config() -> Bm25Config:
+    """Return one canonical BM25 configuration for indexing and querying."""
+    language = settings.QDRANT_SPARSE_LANGUAGE.strip().lower()
+    # Qdrant 1.18.x uses the legacy ``language=none`` switch to disable the
+    # default English stemmer and stop-word list.  The explicit
+    # ``stemmer={type:none}`` representation was introduced in Qdrant 1.19 and
+    # is rejected by the Docker version pinned by this repository.  Keep this
+    # wire contract aligned with the deployed server and include it in the
+    # ingestion fingerprint so a future 1.19 migration cannot mix vectors.
+    return Bm25Config(
+        k=settings.QDRANT_SPARSE_K,
+        b=settings.QDRANT_SPARSE_B,
+        avg_len=settings.QDRANT_SPARSE_AVG_LEN,
+        tokenizer=_tokenizer(),
+        language=language or None,
+        lowercase=True,
+        ascii_folding=False,
+    )
+
+
+def sparse_document(text: str) -> Document:
+    """Build the native sparse-inference document used by Qdrant core."""
+    return Document(
+        text=text,
+        model=settings.QDRANT_SPARSE_MODEL,
+        options=bm25_config(),
+    )
+
+
+def format_results(raw_results: list, *, scope: RetrievalScope) -> list[dict]:
+    """Convert Qdrant points and reject any out-of-scope backend result."""
+    formatted: list[dict] = []
+    for result in raw_results:
+        payload = result.payload or {}
+        if not scope.allows(payload.get("dataset_id")):
+            continue
+        formatted.append({
+            "chunk_id": result.id,
+            "content": payload.get("content", ""),
+            "score": getattr(result, "score", 0.0),
+            "parent_id": payload.get("parent_id"),
+            "file_name": payload.get("file_name", ""),
+            "source_uri": payload.get("source_uri") or payload.get("source_path", ""),
+            "section_title": payload.get("section_title", ""),
+            "page_number": payload.get("page_number"),
+            "dataset_id": payload.get("dataset_id"),
+            "generation_id": payload.get("generation_id"),
+            "source": "sparse",
+        })
+    return formatted
+
+
+def invalidate_bm25_index() -> None:
+    """Compatibility no-op: native Qdrant indexes are visible after commit."""
+    logger.debug("Native Qdrant sparse index requires no process-local invalidation")
 
 
 class SparseSearcher:
-    """Tìm kiếm bằng BM25 keyword matching.
-
-    Index được chia sẻ ở module level: tạo bao nhiêu instance cũng chỉ build 1 lần.
-    Gọi invalidate_bm25_index() sau khi ingest để nạp lại.
-    """
+    """Search Qdrant's native BM25 sparse index with the retrieval scope."""
 
     def __init__(self):
         self.qdrant = QdrantConnector()
@@ -83,115 +110,20 @@ class SparseSearcher:
         top_k: int | None = None,
         *,
         scope: RetrievalScope | None = None,
+        collection_name: str | None = None,
     ) -> list[dict]:
-        """Search bằng BM25 keyword matching.
-
-        Lần đầu gọi sẽ build index (load tất cả docs từ Qdrant).
-        Các lần sau dùng index đã build (cached).
-
-        Args:
-            query: Câu hỏi của user
-            top_k: Số kết quả trả về
-
-        Returns:
-            List[dict] — mỗi dict có: chunk_id, content, score, metadata
-        """
         top_k = top_k or settings.TOP_K
         scope = scope or default_scope()
-
-        index, documents = self._ensure_index(scope)
-        if not documents or index is None:
+        if not query.strip():
             return []
-
-        # Tokenize query — giữ mã hiệu dính dấu câu
-        query_tokens = tokenize(query)
-        if not query_tokens:
-            logger.info("BM25 search skipped — query has no usable tokens")
-            return []
-
-        # BM25 scoring
-        scores = index.get_scores(query_tokens)
-
-        # top-k bằng heap thay vì sort toàn bộ corpus (O(n log k) thay vì O(n log n))
-        top_idx = heapq.nlargest(top_k, range(len(scores)), key=scores.__getitem__)
-
-        # Format kết quả
-        results = []
-        for i in top_idx:
-            if scores[i] <= 0:              # chỉ lấy docs match ít nhất 1 từ
-                continue
-            doc = documents[i]
-            results.append({
-                "chunk_id": doc["chunk_id"],
-                "content": doc["content"],
-                "score": float(scores[i]),
-                "parent_id": doc.get("parent_id"),
-                "file_name": doc.get("file_name", ""),
-                "section_title": doc.get("section_title", ""),
-                "page_number": doc.get("page_number"),
-                "dataset_id": doc.get("dataset_id"),
-                "source": "sparse",  # Đánh dấu nguồn
-            })
-
-        logger.info("BM25 search done", query=query[:50], results=len(results))
+        points = self.qdrant.search_sparse(
+            collection_name=collection_name or settings.CHILD_COLLECTION,
+            query=sparse_document(query),
+            sparse_vector_name=settings.QDRANT_SPARSE_VECTOR_NAME,
+            limit=top_k,
+            query_filter=scope.qdrant_filter(),
+        )
+        results = format_results(points, scope=scope)
+        logger.info("Sparse search done", results=len(results))
+        logger.info("Retrieval metric", retrieval_mode="sparse_only", result_count=len(results))
         return results
-
-    def _ensure_index(self, scope: RetrievalScope):
-        """Lấy index dùng chung, build nếu chưa có (thread-safe)."""
-        with _index_lock:
-            cached = _index_cache.get(scope.cache_key)
-            if cached is None:
-                cached = self._build_index_locked(scope)
-                _index_cache[scope.cache_key] = cached
-            return cached
-
-    def _build_index_locked(
-        self,
-        scope: RetrievalScope,
-    ) -> tuple[BM25Okapi | None, list[dict]]:
-        """Load tất cả documents từ Qdrant → build BM25 index.
-
-        Gọi 1 lần duy nhất (đã nằm trong lock), kết quả cached cho các query sau.
-        """
-        logger.info("Building BM25 index...")
-
-        # Đọc tất cả child chunks từ Qdrant
-        try:
-            points = self.qdrant.scroll_all(
-                settings.CHILD_COLLECTION,
-                scroll_filter=scope.qdrant_filter(),
-            )
-        except Exception as exc:
-            # Chi tiết SDK chỉ nằm trong traceback server-side; public layer
-            # dùng RetrievalError.public_message để tránh leak hạ tầng.
-            logger.exception(
-                "Failed to read child collection for BM25",
-                collection=settings.CHILD_COLLECTION,
-            )
-            raise RetrievalError(
-                f"Failed to read collection '{settings.CHILD_COLLECTION}' for BM25"
-            ) from exc
-
-        documents, corpus = [], []  # corpus = tokenized documents cho BM25
-
-        for point in points:
-            payload = point.payload or {}
-            if not scope.allows(payload.get("dataset_id")):
-                continue
-            content = payload.get("content", "")
-            if not content:
-                continue
-            documents.append({
-                "chunk_id": point.id,
-                "content": content,
-                "parent_id": payload.get("parent_id"),
-                "file_name": payload.get("file_name", ""),
-                "section_title": payload.get("section_title", ""),
-                "page_number": payload.get("page_number"),
-                "dataset_id": payload.get("dataset_id"),
-            })
-            # Tokenize: giữ mã hiệu dính dấu câu
-            corpus.append(tokenize(content))
-
-        logger.info("BM25 index built", total_documents=len(documents))
-        return BM25Okapi(corpus) if corpus else None, documents
