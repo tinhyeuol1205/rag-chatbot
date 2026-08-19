@@ -72,16 +72,24 @@ make ingest
 # 4a. Start API backend (FastAPI, port 8080; inline dev mode)
 make run-api
 
-# 4b. Start chatbot UI (Gradio, port 7860)
-make run-ui
+# 4b. Start thin chatbot UI (Gradio → FastAPI, port 7860)
+make run-ui UI_DEMO_MODE=dev
 
-# Production: set RAG_EXECUTION_MODE=redis_worker and run the worker separately
+# Product-like demo: API + worker phải chạy trước, sau đó UI chỉ gọi FastAPI
 make run-worker
+make run-api API_HOST=0.0.0.0 API_RELOAD=false
+make run-ui UI_DEMO_MODE=product UI_API_BASE_URL=http://127.0.0.1:8080
 ```
 
 **Ghi chú:** production API/worker dùng Redis admission; chỉ worker sau khi
 reserve quota mới chạy embedding → Qdrant → reranking → LLM. `inline` là adapter
 dev/test và không tạo backlog phân tán.
+
+`make run-ui` luôn là thin client qua FastAPI. Profile `dev` yêu cầu API
+`RAG_EXECUTION_MODE=inline`; profile `product` yêu cầu Redis worker, remote
+BGE-M3/reranker và worker heartbeat. Product profile trong PR15 dành cho internal
+trusted-network demo; nó chưa cung cấp user identity, document ACL hay public
+production security.
 
 ## 📁 Project Structure
 
@@ -162,6 +170,10 @@ curl -X POST http://127.0.0.1:8080/chat \
 | `error` | `{"code", "message"}` | Lỗi an toàn (không leak nội bộ) |
 | `end` | `{}` | Kết thúc stream |
 
+Trong `redis_worker` mode, worker publish token vào Redis per-job event stream và
+API relay ngay qua SSE; UI không đợi buffer toàn answer. Event có sequence/ID và
+TTL hữu hạn để hỗ trợ reconnect/dedup trong phạm vi một job.
+
 ### Ingestion sync
 
 `make ingest-sync` đồng bộ Qdrant với source directory — file bị xoá khỏi thư mục
@@ -211,6 +223,9 @@ Xem bảng thay đổi PR11 tại
 [docs/pr11-changes-and-deployment.md](docs/pr11-changes-and-deployment.md) và
 runbook triển khai PR14 tại
 [docs/pr14-deployment.md](docs/pr14-deployment.md).
+
+Handbook vận hành từ đầu, ingest dữ liệu mới và các workflow product xem tại
+[docs/product-handbook.md](docs/product-handbook.md).
 
 ## 🗺️ Port Map
 

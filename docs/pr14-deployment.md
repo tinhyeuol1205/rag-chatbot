@@ -6,6 +6,9 @@ Các `RequestDeadline`, stage semaphore, fan-out cap và token-aware context
 budget của PR12 đã được hoàn nguyên. Context vẫn dùng `MAX_CONTEXT_CHARS` của
 baseline; `LLM_MAX_OUTPUT_TOKENS` chỉ là giới hạn output/cost của provider.
 
+Runbook tách riêng luồng dev/product, ingest dữ liệu mới và clean dữ liệu cũ xem
+tại [docs/product-handbook.md](product-handbook.md).
+
 ## Kiến trúc production
 
 ```text
@@ -114,4 +117,3 @@ switch alias về generation cũ bằng `IngestionPipeline().rollback(<generatio
 rồi xác nhận `/ready` và một truy vấn smoke trong đúng scope. Không trộn child
 generation mới với parent generation cũ và không xóa generation cũ trước khi
 hết thời gian có request đang chạy.
-

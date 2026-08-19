@@ -44,15 +44,27 @@ ingest-load: ## Chạy load benchmark PR11 (DATA_DIR=/srv/corpus)
 
 API_HOST ?= 127.0.0.1
 API_PORT ?= 8080          # ★ 8000 đang bị vLLM dùng — xem review PR 4 / P2-6
+API_RELOAD ?= true
+API_RELOAD_FLAG := $(if $(filter true 1 yes,$(API_RELOAD)),--reload,)
 
 run-api: ## Chạy FastAPI backend (mặc định 127.0.0.1:8080)
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m uvicorn api.main:app --host $(API_HOST) --port $(API_PORT) --reload
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m uvicorn api.main:app --host $(API_HOST) --port $(API_PORT) $(API_RELOAD_FLAG)
 
 run-worker: ## Chạy Redis Streams RAG worker (production mode)
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m workers.rag_worker
 
-run-ui: ## Chạy Gradio chat UI (port 7860)
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m api.ui
+UI_DEMO_MODE ?= dev
+UI_API_BASE_URL ?= http://127.0.0.1:8080
+UI_HOST ?= 127.0.0.1
+UI_PORT ?= 7860
+UI_PUBLIC_SHARE ?= false
+
+run-ui: ## Chạy thin UI qua FastAPI: UI_DEMO_MODE=dev|product
+	@if [ "$(UI_DEMO_MODE)" != "dev" ] && [ "$(UI_DEMO_MODE)" != "product" ]; then \
+		echo "UI_DEMO_MODE phải là dev hoặc product (giá trị: $(UI_DEMO_MODE))" >&2; \
+		exit 2; \
+	fi
+	UI_DEMO_MODE=$(UI_DEMO_MODE) UI_API_BASE_URL=$(UI_API_BASE_URL) UI_HOST=$(UI_HOST) UI_PORT=$(UI_PORT) UI_PUBLIC_SHARE=$(UI_PUBLIC_SHARE) PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m api.ui
 
 # ======================================
 # ----------- Evaluation ---------------
