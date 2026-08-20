@@ -52,6 +52,11 @@ class Settings(BaseSettings):
             "INGEST_QDRANT_MAX_RETRIES": self.INGEST_QDRANT_MAX_RETRIES,
             "INGEST_GENERATION_RETENTION": self.INGEST_GENERATION_RETENTION,
             "INGEST_MAX_MEMORY_MB": self.INGEST_MAX_MEMORY_MB,
+            "INGEST_PDF_PAGE_WINDOW": self.INGEST_PDF_PAGE_WINDOW,
+            "INGEST_PDF_OCR_PAGE_WINDOW": self.INGEST_PDF_OCR_PAGE_WINDOW,
+            "INGEST_PDF_MAX_PAGES": self.INGEST_PDF_MAX_PAGES,
+            "INGEST_PDF_SPOOL_MAX_MB": self.INGEST_PDF_SPOOL_MAX_MB,
+            "INGEST_PDF_WINDOW_TIMEOUT_SECONDS": self.INGEST_PDF_WINDOW_TIMEOUT_SECONDS,
             "RAG_QUEUE_MAX_OUTSTANDING": self.RAG_QUEUE_MAX_OUTSTANDING,
             "RAG_JOB_MAX_WAIT_SECONDS": self.RAG_JOB_MAX_WAIT_SECONDS,
             "RAG_JOB_TTL_SECONDS": self.RAG_JOB_TTL_SECONDS,
@@ -69,10 +74,26 @@ class Settings(BaseSettings):
             "QDRANT_HYBRID_PREFETCH_LIMIT": self.QDRANT_HYBRID_PREFETCH_LIMIT,
             "QDRANT_SPARSE_AVG_LEN": self.QDRANT_SPARSE_AVG_LEN,
             "MAX_CONTEXT_CHARS": self.MAX_CONTEXT_CHARS,
+            "UI_CONNECT_TIMEOUT_SECONDS": self.UI_CONNECT_TIMEOUT_SECONDS,
+            "UI_REQUEST_TIMEOUT_SECONDS": self.UI_REQUEST_TIMEOUT_SECONDS,
+            "UI_SSE_IDLE_TIMEOUT_SECONDS": self.UI_SSE_IDLE_TIMEOUT_SECONDS,
+            "UI_PORT": self.UI_PORT,
+            "UI_MAX_INPUT_CHARS": self.UI_MAX_INPUT_CHARS,
+            "UI_HISTORY_MAX_TURNS": self.UI_HISTORY_MAX_TURNS,
+            "REDIS_JOB_EVENT_TTL_SECONDS": self.REDIS_JOB_EVENT_TTL_SECONDS,
+            "RAG_WORKER_HEARTBEAT_TTL_SECONDS": self.RAG_WORKER_HEARTBEAT_TTL_SECONDS,
         }
         invalid = [name for name, value in positive_limits.items() if value <= 0]
         if invalid:
             raise ConfigurationError(f"Ingestion limits must be positive: {invalid}")
+        if self.INGEST_PDF_OCR_PAGE_WINDOW > self.INGEST_PDF_PAGE_WINDOW:
+            raise ConfigurationError(
+                "INGEST_PDF_OCR_PAGE_WINDOW cannot exceed INGEST_PDF_PAGE_WINDOW"
+            )
+        if self.INGEST_PDF_OCR_MODE not in {"never", "missing_pages", "always"}:
+            raise ConfigurationError(
+                "INGEST_PDF_OCR_MODE must be never, missing_pages or always"
+            )
         retry_delays = {
             "INGEST_RETRY_BASE_SECONDS": self.INGEST_RETRY_BASE_SECONDS,
             "INGEST_RETRY_MAX_SECONDS": self.INGEST_RETRY_MAX_SECONDS,
@@ -95,6 +116,21 @@ class Settings(BaseSettings):
             raise ConfigurationError(f"Ingestion quality ratios must be between 0 and 1: {invalid_ratios}")
         if self.RAG_EXECUTION_MODE not in {"inline", "redis_worker"}:
             raise ConfigurationError("RAG_EXECUTION_MODE must be inline or redis_worker")
+        if self.UI_DEMO_MODE not in {"dev", "product"}:
+            raise ConfigurationError("UI_DEMO_MODE must be dev or product")
+        if self.UI_PUBLIC_SHARE and not (self.UI_AUTH_USERNAME.strip() and self.UI_AUTH_PASSWORD):
+            raise ConfigurationError(
+                "UI_PUBLIC_SHARE requires both UI_AUTH_USERNAME and UI_AUTH_PASSWORD"
+            )
+        if self.UI_DEMO_MODE == "product":
+            if self.RAG_EXECUTION_MODE != "redis_worker":
+                raise ConfigurationError("Product UI requires RAG_EXECUTION_MODE=redis_worker")
+            if not self.API_KEY.strip() or not self.UI_API_KEY.strip():
+                raise ConfigurationError("Product UI requires API_KEY and UI_API_KEY")
+        if self.REDIS_JOB_EVENT_TTL_SECONDS < self.RAG_JOB_MAX_WAIT_SECONDS:
+            raise ConfigurationError(
+                "REDIS_JOB_EVENT_TTL_SECONDS must cover RAG_JOB_MAX_WAIT_SECONDS"
+            )
         if self.EMBEDDING_RUNTIME not in {"local", "remote"}:
             raise ConfigurationError("EMBEDDING_RUNTIME must be local or remote")
         if self.RERANKER_RUNTIME not in {"local", "remote"}:
@@ -162,6 +198,22 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = ["http://localhost:7860", "http://127.0.0.1:7860"]
     API_KEY: str = ""     # để trống = tắt auth (dev); set giá trị = bật auth
 
+    # --- Thin Gradio UI (PR15) ---
+    # UI không kết nối trực tiếp tới retriever/Redis/Qdrant.  Nó chỉ gọi FastAPI.
+    UI_DEMO_MODE: str = "dev"  # dev -> inline API; product -> Redis worker API
+    UI_API_BASE_URL: str = "http://127.0.0.1:8080"
+    UI_HOST: str = "127.0.0.1"
+    UI_PORT: int = 7860
+    UI_CONNECT_TIMEOUT_SECONDS: float = 3.0
+    UI_REQUEST_TIMEOUT_SECONDS: float = 90.0
+    UI_SSE_IDLE_TIMEOUT_SECONDS: float = 45.0
+    UI_MAX_INPUT_CHARS: int = 2_000
+    UI_HISTORY_MAX_TURNS: int = 3
+    UI_API_KEY: str = ""  # service credential; không gửi xuống browser
+    UI_AUTH_USERNAME: str = ""
+    UI_AUTH_PASSWORD: str = ""
+    UI_PUBLIC_SHARE: bool = False  # chỉ bật explicit với basic auth
+
     # --- Logging ---
     LOG_LEVEL: str = "INFO"     # DEBUG / INFO / WARNING / ERROR
     LOG_JSON: bool = False      # True → JSON output (cho ELK/Datadog)
@@ -184,6 +236,8 @@ class Settings(BaseSettings):
     REDIS_RATE_RESERVATION_PREFIX: str = "rag:default:reservation:"
     REDIS_JOB_PREFIX: str = "rag:default:job:"
     REDIS_IDEMPOTENCY_PREFIX: str = "rag:default:idempotency:"
+    REDIS_JOB_EVENT_PREFIX: str = "rag:default:events:"
+    REDIS_JOB_EVENT_TTL_SECONDS: int = 300
     REDIS_CONNECT_TIMEOUT_SECONDS: float = 2.0
     REDIS_SOCKET_TIMEOUT_SECONDS: float = 2.0
     REDIS_RESULT_POLL_SECONDS: float = 0.1
@@ -192,6 +246,7 @@ class Settings(BaseSettings):
     RAG_JOB_TTL_SECONDS: int = 600
     RAG_WORKER_CONCURRENCY: int = 2
     RAG_WORKER_LEASE_SECONDS: int = 300
+    RAG_WORKER_HEARTBEAT_TTL_SECONDS: int = 10
     LLM_RATE_LIMIT_CALLS: int = 15
     LLM_RATE_LIMIT_WINDOW_SECONDS: float = 60.0
     LLM_RESERVATION_TTL_SECONDS: int = 600
@@ -242,6 +297,12 @@ class Settings(BaseSettings):
     INGEST_FAIL_ON_QUALITY: bool = True
     INGEST_PDF_FAST_STRATEGY: str = "fast"
     INGEST_PDF_OCR_STRATEGY: str = "hi_res"
+    INGEST_PDF_PAGE_WINDOW: int = 16
+    INGEST_PDF_OCR_PAGE_WINDOW: int = 4
+    INGEST_PDF_OCR_MODE: str = "missing_pages"
+    INGEST_PDF_MAX_PAGES: int = 5000
+    INGEST_PDF_SPOOL_MAX_MB: int = 64
+    INGEST_PDF_WINDOW_TIMEOUT_SECONDS: int = 300
 
     # --- Qdrant native BM25 / server-side hybrid retrieval ---
     QDRANT_SPARSE_VECTOR_NAME: str = "bm25"

@@ -35,7 +35,7 @@ from ingestion.batching import iter_batches
 from ingestion.chunking.parent_child import iter_parent_child_chunks, parent_child_chunk
 from ingestion.embeddings import EmbeddingService
 from ingestion.manifest import ManifestStore, pipeline_fingerprint, sha256_file
-from ingestion.models import Chunk, EmbeddedChunk, ParseQuality, RawDocument
+from ingestion.models import Chunk, EmbeddedChunk, ParseQuality, ParseWindow, RawDocument
 from ingestion.parsers import ParserDispatcher
 from retrieval.search.sparse import sparse_document
 
@@ -60,6 +60,18 @@ class PreparedFile:
     file_name: str
     parents: list[Chunk]
     children: list[EmbeddedChunk]
+
+
+@dataclass
+class SourceIngestState:
+    """Small per-source counters; window documents are never retained here."""
+
+    parent_count: int = 0
+    child_count: int = 0
+    quality: ParseQuality = field(default_factory=ParseQuality)
+    windows_completed: int = 0
+    pages_completed: int = 0
+    peak_rss_bytes: int = 0
 
 
 @dataclass
@@ -291,7 +303,11 @@ class IngestionPipeline:
             )
         vector_dimension = self.embedder.dimension
         fingerprint = pipeline_fingerprint(embedding_dimension=vector_dimension)
-        self._recover_alias_activation(fingerprint=fingerprint, vector_dimension=vector_dimension)
+        # A dry-run is intentionally usable before Qdrant/Docker is started.
+        # Alias recovery performs a network read and must only run on a real
+        # generation ingestion.
+        if not dry_run:
+            self._recover_alias_activation(fingerprint=fingerprint, vector_dimension=vector_dimension)
         if self.manifest.is_generation_committed(settings.INGEST_DATASET_ID, generation_id):
             raise ValueError(
                 "Committed ingestion generations are immutable; start a new generation"
@@ -424,51 +440,154 @@ class IngestionPipeline:
 
                 try:
                     parser = ParserDispatcher.get_parser(source["path"])
-                    documents, quality = parser.parse_with_quality(source["path"])
-                    self._enforce_source_memory_budget(source_uri, documents)
-                    quality_by_file[source_uri] = quality.as_dict()
-                    if not self._quality_acceptable(quality, documents):
+                    state = SourceIngestState()
+                    working_matches = bool(
+                        previous
+                        and previous.working_generation == generation_id
+                        and previous.working_content_sha256 == content_hash
+                        and previous.working_fingerprint == fingerprint
+                    )
+                    if not working_matches:
+                        # A retry with a changed source/config starts from a
+                        # clean staging source. A same-job resume keeps window
+                        # checkpoints so completed pages are not reparsed.
+                        delete_source = getattr(self.qdrant, "delete_by_file_name_scoped", None)
+                        if delete_source is not None:
+                            delete_source(
+                                child_collection,
+                                source_uri,
+                                dataset_id=settings.INGEST_DATASET_ID,
+                            )
+                            delete_source(
+                                parent_collection,
+                                source_uri,
+                                dataset_id=settings.INGEST_DATASET_ID,
+                            )
+                        self.manifest.clear_source_checkpoints(
+                            dataset_id=settings.INGEST_DATASET_ID,
+                            generation_id=generation_id,
+                            source_uri=source_uri,
+                        )
+
+                    if working_matches:
+                        summary_fn = getattr(self.manifest, "window_summary", None)
+                        if summary_fn is not None:
+                            summary = summary_fn(
+                                dataset_id=settings.INGEST_DATASET_ID,
+                                generation_id=generation_id,
+                                source_uri=source_uri,
+                                content_sha256=content_hash,
+                                fingerprint=fingerprint,
+                            )
+                            state.parent_count = int(summary.get("parents") or 0)
+                            state.child_count = int(summary.get("children") or 0)
+                            state.windows_completed = int(summary.get("windows") or 0)
+                            state.pages_completed = int(summary.get("pages") or 0)
+                            state.quality = summary.get("quality") or ParseQuality()
+
+                    resume_page = 1
+                    resume_page_fn = getattr(self.manifest, "resume_page", None)
+                    if working_matches and resume_page_fn is not None:
+                        resume_page = resume_page_fn(
+                            dataset_id=settings.INGEST_DATASET_ID,
+                            generation_id=generation_id,
+                            source_uri=source_uri,
+                            content_sha256=content_hash,
+                            fingerprint=fingerprint,
+                        )
+
+                    windows = parser.iter_windows(source["path"], start_page=resume_page)
+                    window_seen = False
+                    for window in windows:
+                        window_seen = True
+                        window_key = window.key
+                        checkpoint = self._get_verified_window_checkpoint(
+                            source_uri=source_uri,
+                            content_sha256=content_hash,
+                            fingerprint=fingerprint,
+                            generation_id=generation_id,
+                            window=window,
+                            child_collection=child_collection,
+                            parent_collection=parent_collection,
+                        )
+                        if checkpoint is not None:
+                            checkpoint_quality = ParseQuality(**(checkpoint.get("quality") or {}))
+                            state.quality = state.quality.merge(checkpoint_quality)
+                            state.parent_count += int(checkpoint.get("parent_count") or 0)
+                            state.child_count += int(checkpoint.get("child_count") or 0)
+                            state.windows_completed += 1
+                            state.pages_completed += max(window.end_page - window.start_page + 1, 0)
+                            quality_by_file[source_uri] = state.quality.as_dict()
+                            logger.info(
+                                "Skipped committed parse window",
+                                source=source_uri,
+                                window=window_key,
+                            )
+                            continue
+
+                        self._enforce_window_memory_budget(source_uri, window)
+                        documents = [
+                            self._normalize_document(document, source_uri, content_hash)
+                            for document in window.documents
+                        ]
+                        if any(
+                            len(document.content.strip()) < settings.INGEST_PARSER_MIN_TEXT_CHARS
+                            for document in documents
+                        ):
+                            raise ValueError("parser_quality_threshold_exceeded")
+                        batch_keys = {"parent": [], "child": []}
+                        parent_count, child_count = self._ingest_source(
+                            documents,
+                            source_uri=source_uri,
+                            content_sha256=content_hash,
+                            fingerprint=fingerprint,
+                            generation_id=generation_id,
+                            child_collection=child_collection,
+                            parent_collection=parent_collection,
+                            window_key=window_key,
+                            window_batch_keys=batch_keys,
+                        )
+                        record_window = getattr(self.manifest, "record_window", None)
+                        if record_window is not None:
+                            record_window(
+                                dataset_id=settings.INGEST_DATASET_ID,
+                                generation_id=generation_id,
+                                source_uri=source_uri,
+                                content_sha256=content_hash,
+                                fingerprint=fingerprint,
+                                window_key=window_key,
+                                start_page=window.start_page,
+                                end_page=window.end_page,
+                                parent_count=parent_count,
+                                child_count=child_count,
+                                parent_batch_keys=batch_keys["parent"],
+                                child_batch_keys=batch_keys["child"],
+                                quality=window.quality.as_dict(),
+                            )
+                        state.parent_count += parent_count
+                        state.child_count += child_count
+                        state.quality = state.quality.merge(window.quality)
+                        state.windows_completed += 1
+                        state.pages_completed += max(window.end_page - window.start_page + 1, 0)
+                        quality_by_file[source_uri] = state.quality.as_dict()
+
+                    if not window_seen and state.windows_completed <= 0:
+                        # A committed PDF can legitimately have no remaining
+                        # windows on resume; otherwise an empty parser result
+                        # is a source failure.
+                        raise ValueError("no_parse_windows_emitted")
+                    if not self._quality_acceptable(state.quality, None):
                         raise ValueError("parser_quality_threshold_exceeded")
-                    documents = [self._normalize_document(document, source_uri, content_hash) for document in documents]
-                    # A retry with the same generation may have left points from
-                    # an older file revision. Remove only this staging source;
-                    # immutable active generations are never mutated.
-                    delete_source = getattr(self.qdrant, "delete_by_file_name_scoped", None)
-                    if delete_source is not None:
-                        delete_source(
-                            child_collection,
-                            source_uri,
-                            dataset_id=settings.INGEST_DATASET_ID,
-                        )
-                        delete_source(
-                            parent_collection,
-                            source_uri,
-                            dataset_id=settings.INGEST_DATASET_ID,
-                        )
-                    self.manifest.clear_source_checkpoints(
-                        dataset_id=settings.INGEST_DATASET_ID,
-                        generation_id=generation_id,
-                        source_uri=source_uri,
-                    )
-                    parent_count, child_count = self._ingest_source(
-                        documents,
-                        source_uri=source_uri,
-                        content_sha256=content_hash,
-                        fingerprint=fingerprint,
-                        generation_id=generation_id,
-                        child_collection=child_collection,
-                        parent_collection=parent_collection,
-                    )
-                    if parent_count <= 0 or child_count <= 0:
+                    if state.parent_count <= 0 or state.child_count <= 0:
                         raise ValueError("no_chunks_emitted")
                     self.manifest.mark_source(
                         dataset_id=settings.INGEST_DATASET_ID,
                         source_uri=source_uri,
                         status="committed",
                         generation_id=generation_id,
-                        parent_count=parent_count,
-                        child_count=child_count,
-                        quality=quality.as_dict(),
+                        parent_count=state.parent_count,
+                        child_count=state.child_count,
+                        quality=state.quality.as_dict(),
                     )
                     processed.add(source_uri)
                 except Exception as exc:
@@ -620,6 +739,7 @@ class IngestionPipeline:
     ) -> IngestionResult:
         discovered: set[str] = set()
         skipped: set[str] = set()
+        quality_by_file: dict[str, dict] = {}
         for source in self._iter_source_files(data_path):
             source_uri = source["source_uri"]
             discovered.add(source_uri)
@@ -627,6 +747,19 @@ class IngestionPipeline:
             previous = self.manifest.get_source(settings.INGEST_DATASET_ID, source_uri)
             if previous and previous.status == "committed" and previous.content_sha256 == content_hash and previous.fingerprint == fingerprint:
                 skipped.add(source_uri)
+                if previous.quality:
+                    quality_by_file[source_uri] = previous.quality
+                continue
+            parser = ParserDispatcher.get_parser(source["path"])
+            quality = ParseQuality()
+            window_count = 0
+            for window in parser.iter_windows(source["path"]):
+                self._enforce_window_memory_budget(source_uri, window)
+                quality = quality.merge(window.quality)
+                window_count += 1
+            if window_count <= 0 or not self._quality_acceptable(quality, None):
+                raise ValueError(f"parser_quality_threshold_exceeded:{source_uri}")
+            quality_by_file[source_uri] = quality.as_dict()
         active_records = self.manifest.list_sources(settings.INGEST_DATASET_ID)
         previous_generation = next(
             (
@@ -658,6 +791,7 @@ class IngestionPipeline:
                 "discovered": sorted(discovered),
                 "skipped": sorted(skipped),
                 "planned_pruned_files": sorted(planned_pruned_files),
+                "quality_by_file": quality_by_file,
             },
         )
         return IngestionResult(
@@ -668,6 +802,7 @@ class IngestionPipeline:
             dry_run=True,
             job_id=job_id,
             generation_id=generation_id,
+            quality_by_file=quality_by_file,
         )
 
     def _recover_alias_activation(self, *, fingerprint: str, vector_dimension: int) -> None:
@@ -775,12 +910,18 @@ class IngestionPipeline:
         })
 
     @staticmethod
-    def _quality_acceptable(quality: ParseQuality, documents: list[RawDocument]) -> bool:
-        if not documents:
+    def _quality_acceptable(
+        quality: ParseQuality,
+        documents: list[RawDocument] | None,
+    ) -> bool:
+        if documents is not None and not documents:
             return False
         if not settings.INGEST_FAIL_ON_QUALITY:
             return True
-        if any(len(document.content.strip()) < settings.INGEST_PARSER_MIN_TEXT_CHARS for document in documents):
+        if documents is not None and any(
+            len(document.content.strip()) < settings.INGEST_PARSER_MIN_TEXT_CHARS
+            for document in documents
+        ):
             return False
         if quality.characters_emitted <= 0:
             return False
@@ -821,9 +962,83 @@ class IngestionPipeline:
             memory_budget_bytes=limit,
         )
 
+    @staticmethod
+    def _enforce_window_memory_budget(source_uri: str, window: ParseWindow) -> None:
+        """Fail closed at the window boundary before requesting the next one."""
+        estimated_bytes = window.estimated_bytes or sum(
+            len(document.content.encode("utf-8")) * 2 + 1024
+            for document in window.documents
+        )
+        limit = settings.INGEST_MAX_MEMORY_MB * 1024 * 1024
+        try:
+            import psutil
+
+            rss_bytes = psutil.Process().memory_info().rss
+        except Exception:  # noqa: BLE001 - optional observability fallback
+            rss_bytes = 0
+        if estimated_bytes > limit or rss_bytes > limit:
+            raise MemoryError(
+                f"source {source_uri} exceeds ingestion window memory budget: "
+                f"estimated={estimated_bytes} rss={rss_bytes} limit={limit}"
+            )
+        logger.info(
+            "Ingestion window memory",
+            source=source_uri,
+            window=window.key,
+            estimated_bytes=estimated_bytes,
+            rss_bytes=rss_bytes,
+        )
+
+    def _get_verified_window_checkpoint(
+        self,
+        *,
+        source_uri: str,
+        content_sha256: str,
+        fingerprint: str,
+        generation_id: str,
+        window: ParseWindow,
+        child_collection: str,
+        parent_collection: str,
+    ) -> dict | None:
+        """Verify window batch points before allowing parser resume to skip it."""
+        get_window = getattr(self.manifest, "get_window", None)
+        if get_window is None:
+            return None
+        checkpoint = get_window(
+            dataset_id=settings.INGEST_DATASET_ID,
+            generation_id=generation_id,
+            source_uri=source_uri,
+            content_sha256=content_sha256,
+            fingerprint=fingerprint,
+            window_key=window.key,
+        )
+        if checkpoint is None:
+            return None
+        collections = (
+            (parent_collection, checkpoint.get("parent_batch_keys", [])),
+            (child_collection, checkpoint.get("child_batch_keys", [])),
+        )
+        for collection_name, batch_keys in collections:
+            for batch_key in batch_keys:
+                point_ids = self.manifest.batch_committed(
+                    dataset_id=settings.INGEST_DATASET_ID,
+                    generation_id=generation_id,
+                    source_uri=source_uri,
+                    batch_key=batch_key,
+                    collection_name=collection_name,
+                    content_sha256=content_sha256,
+                    fingerprint=fingerprint,
+                )
+                if not point_ids:
+                    return None
+                existing_ids = self.qdrant.get_existing_ids(collection_name, point_ids)
+                if existing_ids < set(point_ids):
+                    return None
+        return checkpoint
+
     def _ingest_source(
         self,
-        documents: list[RawDocument],
+        documents: Iterator[RawDocument] | list[RawDocument],
         *,
         source_uri: str,
         content_sha256: str,
@@ -831,13 +1046,15 @@ class IngestionPipeline:
         generation_id: str,
         child_collection: str,
         parent_collection: str,
+        window_key: str = "document:000000",
+        window_batch_keys: dict[str, list[str]] | None = None,
     ) -> tuple[int, int]:
         parent_count = 0
         child_count = 0
         child_batch_index = 0
         for parent_batch_index, (parents, children) in enumerate(iter_parent_child_chunks(documents)):
             parent_points = [self._parent_point(chunk, generation_id) for chunk in parents]
-            parent_key = f"{source_uri}:parent:{parent_batch_index}"
+            parent_key = f"{source_uri}:{window_key}:parent:{parent_batch_index}"
             parent_ids = [str(point.id) for point in parent_points]
             if not self._checkpoint_complete(
                 source_uri, generation_id, parent_key, parent_collection, parent_ids, content_sha256, fingerprint
@@ -853,6 +1070,8 @@ class IngestionPipeline:
                 content_sha256=content_sha256,
                 fingerprint=fingerprint,
             )
+            if window_batch_keys is not None:
+                window_batch_keys.setdefault("parent", []).append(parent_key)
             parent_count += len(parent_points)
 
             for child_batch in iter_batches(
@@ -862,7 +1081,7 @@ class IngestionPipeline:
                 size_of=lambda chunk: len(chunk.content.encode("utf-8")) + 256,
             ):
                 child_ids = [chunk.chunk_id for chunk in child_batch]
-                child_key = f"{source_uri}:child:{child_batch_index}"
+                child_key = f"{source_uri}:{window_key}:child:{child_batch_index}"
                 checkpointed = self._checkpoint_complete(
                     source_uri, generation_id, child_key, child_collection, child_ids, content_sha256, fingerprint
                 )
@@ -880,6 +1099,8 @@ class IngestionPipeline:
                     content_sha256=content_sha256,
                     fingerprint=fingerprint,
                 )
+                if window_batch_keys is not None:
+                    window_batch_keys.setdefault("child", []).append(child_key)
                 child_count += len(child_batch)
                 child_batch_index += 1
         return parent_count, child_count

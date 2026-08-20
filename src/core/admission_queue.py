@@ -368,10 +368,109 @@ class RedisAdmissionQueue:
             time.sleep(settings.REDIS_RESULT_POLL_SECONDS)
         raise JobTimeoutError("RAG job result wait timed out")
 
+    @staticmethod
+    def _event_stream(job_id: str) -> str:
+        """Return the isolated Redis stream used by one UI/API request."""
+        return f"{settings.REDIS_JOB_EVENT_PREFIX}{job_id}"
+
+    def publish_event(self, job_id: str, event: dict[str, Any]) -> str:
+        """Append one typed worker event and refresh its bounded retention TTL."""
+        if not isinstance(event, dict):
+            raise TypeError("RAG event must be a dictionary")
+        event_name = str(event.get("event", "message"))
+        data = event.get("data", {})
+        stream = self._event_stream(job_id)
+        job_key = self._job_key(job_id)
+        try:
+            sequence = self.client.hincrby(job_key, "event_sequence", 1)
+            message_id = self.client.xadd(
+                stream,
+                {
+                    "sequence": str(sequence),
+                    "event": event_name,
+                    "data": json.dumps(data, ensure_ascii=False),
+                },
+            )
+            self.client.hset(job_key, "event_stream", stream)
+            self.client.expire(stream, settings.REDIS_JOB_EVENT_TTL_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - convert transport details to a safe queue error
+            self._raise_redis(exc)
+        return self._text(message_id)
+
+    def read_events(
+        self,
+        job_id: str,
+        *,
+        last_id: str = "0-0",
+        block_ms: int = 500,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Read new events and return ``(events, current_job_state)``.
+
+        ``last_id`` makes reconnects idempotent: Redis returns only messages
+        after the last event already rendered by the browser.  The terminal job
+        state is returned as a second value so an old worker can still be
+        diagnosed even if it crashed before publishing its final event.
+        """
+        stream = self._event_stream(job_id)
+        try:
+            rows = self.client.xread({stream: last_id}, count=100, block=block_ms)
+            data = self.client.hgetall(self._job_key(job_id))
+        except Exception as exc:  # noqa: BLE001 - convert transport details to a safe queue error
+            self._raise_redis(exc)
+        events: list[dict[str, Any]] = []
+        for _stream_name, messages in rows or []:
+            for message_id, fields in messages:
+                event_name = self._text(fields.get("event", fields.get(b"event", "message")))
+                raw_data = self._text(fields.get("data", fields.get(b"data", "{}")))
+                try:
+                    event_data = json.loads(raw_data)
+                except (TypeError, ValueError):
+                    event_data = {"message": raw_data}
+                event = {
+                    "event": event_name,
+                    "data": event_data,
+                    "id": self._text(message_id),
+                    "sequence": self._text(fields.get("sequence", fields.get(b"sequence", ""))),
+                }
+                events.append(event)
+        return events, self._text(self._hash_value(data, "state", "missing"))
+
+    @staticmethod
+    def _worker_heartbeat_key() -> str:
+        return f"{settings.REDIS_KEY_PREFIX}:worker:heartbeat"
+
+    def set_worker_heartbeat(self, worker_id: str) -> None:
+        """Publish a short-lived heartbeat used by API readiness checks."""
+        try:
+            self.client.set(
+                self._worker_heartbeat_key(),
+                worker_id,
+                ex=settings.RAG_WORKER_HEARTBEAT_TTL_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 - readiness must fail closed
+            self._raise_redis(exc)
+
+    def clear_worker_heartbeat(self, worker_id: str) -> None:
+        """Remove this worker's heartbeat without deleting another worker's key."""
+        try:
+            current = self._text(self.client.get(self._worker_heartbeat_key()))
+            if current == worker_id:
+                self.client.delete(self._worker_heartbeat_key())
+        except Exception as exc:  # noqa: BLE001 - cleanup is best effort at shutdown
+            logger.warning("Could not clear RAG worker heartbeat", error_type=type(exc).__name__)
+
+    def worker_available(self) -> bool:
+        """Return whether a worker heartbeat has not expired."""
+        try:
+            return bool(self.client.exists(self._worker_heartbeat_key()))
+        except Exception as exc:  # noqa: BLE001 - readiness maps this to 503
+            self._raise_redis(exc)
+
     def run_once(
         self,
         handler: Callable[[str, list[tuple[str, str]]], Any],
         *,
+        stream_handler: Callable[[str, list[tuple[str, str]], Callable[[dict[str, Any]], None]], Any] | None = None,
         consumer: str | None = None,
         block_ms: int = 1000,
     ) -> str | None:
@@ -423,16 +522,55 @@ class RedisAdmissionQueue:
                 self.client.xack(self.stream, self.group, message_id)
                 return job_id
             self.client.hset(self._job_key(job_id), "state", "running")
+            self._publish_event_safe(
+                job_id,
+                {"event": "status", "data": {"stage": "started"}},
+            )
             history = [tuple(item) for item in json.loads(self._text(self._hash_value(data, "history")) or "[]")]
             with reservation_context(reservation):
-                result = handler(self._text(self._hash_value(data, "query", "")), history)
+                query = self._text(self._hash_value(data, "query", ""))
+                if stream_handler is None:
+                    result = handler(query, history)
+                else:
+                    result = stream_handler(
+                        query,
+                        history,
+                        lambda event: self.publish_event(job_id, event),
+                    )
+            self._publish_event_safe(job_id, {"event": "end", "data": {}})
             self._terminal(job_id, message_id, "completed", _json_safe(result), "", "")
         except JobTimeoutError:
+            self._publish_event_safe(
+                job_id,
+                {
+                    "event": "error",
+                    "data": {"code": "job_timeout", "message": "Yêu cầu đã bị hủy hoặc quá thời gian."},
+                },
+            )
+            self._publish_event_safe(job_id, {"event": "end", "data": {}})
             self._terminal(job_id, message_id, "cancelled", {}, "job_timeout", "RAG job cancelled")
         except Exception as exc:
             logger.exception("RAG worker job failed", job_id=job_id, error_type=type(exc).__name__)
+            self._publish_event_safe(
+                job_id,
+                {
+                    "event": "error",
+                    "data": {
+                        "code": getattr(exc, "error_code", "job_failed"),
+                        "message": getattr(exc, "public_message", "Không thể hoàn tất yêu cầu."),
+                    },
+                },
+            )
+            self._publish_event_safe(job_id, {"event": "end", "data": {}})
             self._terminal(job_id, message_id, "failed", {}, getattr(exc, "error_code", "job_failed"), "RAG job failed")
         return job_id
+
+    def _publish_event_safe(self, job_id: str, event: dict[str, Any]) -> None:
+        """Best-effort terminal/status event; never masks job cleanup."""
+        try:
+            self.publish_event(job_id, event)
+        except QueueUnavailableError:
+            logger.warning("Could not publish RAG job event", job_id=job_id)
 
     def _claim_stale(self, consumer: str) -> list:
         """Reclaim a worker message left pending after a process crash."""

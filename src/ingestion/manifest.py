@@ -23,6 +23,7 @@ from threading import RLock
 from typing import Any
 
 from core.config import settings
+from ingestion.models import ParseQuality
 
 
 def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
@@ -72,6 +73,11 @@ def pipeline_fingerprint(
         "document_window": settings.INGEST_DOCUMENT_WINDOW,
         "pdf_fast_strategy": settings.INGEST_PDF_FAST_STRATEGY,
         "pdf_ocr_strategy": settings.INGEST_PDF_OCR_STRATEGY,
+        "pdf_page_window": settings.INGEST_PDF_PAGE_WINDOW,
+        "pdf_ocr_page_window": settings.INGEST_PDF_OCR_PAGE_WINDOW,
+        "pdf_ocr_mode": settings.INGEST_PDF_OCR_MODE,
+        "pdf_max_pages": settings.INGEST_PDF_MAX_PAGES,
+        "pdf_spool_max_mb": settings.INGEST_PDF_SPOOL_MAX_MB,
         "parser_quality": {
             "max_empty_page_ratio": settings.INGEST_PARSER_MAX_EMPTY_PAGE_RATIO,
             "max_unsupported_ratio": settings.INGEST_PARSER_MAX_UNSUPPORTED_RATIO,
@@ -240,6 +246,24 @@ class ManifestStore:
                     point_count INTEGER NOT NULL,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (dataset_id, generation_id, source_uri, batch_key, collection_name)
+                );
+                CREATE TABLE IF NOT EXISTS parse_window_checkpoints (
+                    dataset_id TEXT NOT NULL,
+                    generation_id TEXT NOT NULL,
+                    source_uri TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    window_key TEXT NOT NULL,
+                    start_page INTEGER NOT NULL,
+                    end_page INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    parent_count INTEGER NOT NULL DEFAULT 0,
+                    child_count INTEGER NOT NULL DEFAULT 0,
+                    parent_batch_keys_json TEXT NOT NULL,
+                    child_batch_keys_json TEXT NOT NULL,
+                    quality_json TEXT,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (dataset_id, generation_id, source_uri, window_key)
                 );
                 """
             )
@@ -545,9 +569,187 @@ class ManifestStore:
                 "DELETE FROM batch_checkpoints WHERE dataset_id=? AND generation_id=? AND source_uri=?",
                 (dataset_id, generation_id, source_uri),
             )
+            connection.execute(
+                "DELETE FROM parse_window_checkpoints WHERE dataset_id=? AND generation_id=? AND source_uri=?",
+                (dataset_id, generation_id, source_uri),
+            )
             connection.commit()
             if self.path != ":memory:":
                 connection.close()
+
+    def record_window(
+        self,
+        *,
+        dataset_id: str,
+        generation_id: str,
+        source_uri: str,
+        content_sha256: str,
+        fingerprint: str,
+        window_key: str,
+        start_page: int,
+        end_page: int,
+        parent_count: int,
+        child_count: int,
+        parent_batch_keys: list[str],
+        child_batch_keys: list[str],
+        quality: dict[str, Any] | None,
+    ) -> None:
+        """Atomically record that one parser window and its batches completed."""
+        with self._lock:
+            connection = self._connect()
+            connection.execute(
+                """
+                INSERT INTO parse_window_checkpoints (
+                    dataset_id, generation_id, source_uri, content_sha256,
+                    fingerprint, window_key, start_page, end_page, status,
+                    parent_count, child_count, parent_batch_keys_json,
+                    child_batch_keys_json, quality_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'committed', ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dataset_id, generation_id, source_uri, window_key)
+                DO UPDATE SET content_sha256=excluded.content_sha256,
+                    fingerprint=excluded.fingerprint, start_page=excluded.start_page,
+                    end_page=excluded.end_page, status='committed',
+                    parent_count=excluded.parent_count, child_count=excluded.child_count,
+                    parent_batch_keys_json=excluded.parent_batch_keys_json,
+                    child_batch_keys_json=excluded.child_batch_keys_json,
+                    quality_json=excluded.quality_json, updated_at=excluded.updated_at
+                """,
+                (
+                    dataset_id,
+                    generation_id,
+                    source_uri,
+                    content_sha256,
+                    fingerprint,
+                    window_key,
+                    start_page,
+                    end_page,
+                    parent_count,
+                    child_count,
+                    json.dumps(parent_batch_keys, sort_keys=True),
+                    json.dumps(child_batch_keys, sort_keys=True),
+                    json.dumps(quality, sort_keys=True) if quality is not None else None,
+                    time.time(),
+                ),
+            )
+            connection.commit()
+            if self.path != ":memory:":
+                connection.close()
+
+    def get_window(
+        self,
+        *,
+        dataset_id: str,
+        generation_id: str,
+        source_uri: str,
+        content_sha256: str,
+        fingerprint: str,
+        window_key: str,
+    ) -> dict[str, Any] | None:
+        """Return a committed window only for the exact source/fingerprint."""
+        with self._lock:
+            connection = self._connect()
+            row = connection.execute(
+                """
+                SELECT * FROM parse_window_checkpoints
+                WHERE dataset_id=? AND generation_id=? AND source_uri=?
+                  AND content_sha256=? AND fingerprint=? AND window_key=?
+                  AND status='committed'
+                """,
+                (
+                    dataset_id,
+                    generation_id,
+                    source_uri,
+                    content_sha256,
+                    fingerprint,
+                    window_key,
+                ),
+            ).fetchone()
+            if self.path != ":memory:":
+                connection.close()
+            if not row:
+                return None
+            result = dict(row)
+            result["parent_batch_keys"] = json.loads(result.pop("parent_batch_keys_json"))
+            result["child_batch_keys"] = json.loads(result.pop("child_batch_keys_json"))
+            result["quality"] = json.loads(result["quality_json"]) if result.get("quality_json") else None
+            return result
+
+    def resume_page(
+        self,
+        *,
+        dataset_id: str,
+        generation_id: str,
+        source_uri: str,
+        content_sha256: str,
+        fingerprint: str,
+    ) -> int:
+        """Return the first page after the contiguous committed window prefix."""
+        with self._lock:
+            connection = self._connect()
+            rows = connection.execute(
+                """
+                SELECT start_page, end_page FROM parse_window_checkpoints
+                WHERE dataset_id=? AND generation_id=? AND source_uri=?
+                  AND content_sha256=? AND fingerprint=? AND status='committed'
+                ORDER BY start_page
+                """,
+                (dataset_id, generation_id, source_uri, content_sha256, fingerprint),
+            ).fetchall()
+            if self.path != ":memory:":
+                connection.close()
+        next_page = 1
+        for row in rows:
+            if row["start_page"] != next_page:
+                break
+            next_page = row["end_page"] + 1
+        return next_page
+
+    def window_summary(
+        self,
+        *,
+        dataset_id: str,
+        generation_id: str,
+        source_uri: str,
+        content_sha256: str,
+        fingerprint: str,
+    ) -> dict[str, Any]:
+        """Summarize exact committed windows for a resumable source."""
+        with self._lock:
+            connection = self._connect()
+            rows = connection.execute(
+                """
+                SELECT start_page, end_page, parent_count, child_count, quality_json
+                FROM parse_window_checkpoints
+                WHERE dataset_id=? AND generation_id=? AND source_uri=?
+                  AND content_sha256=? AND fingerprint=? AND status='committed'
+                ORDER BY start_page
+                """,
+                (dataset_id, generation_id, source_uri, content_sha256, fingerprint),
+            ).fetchall()
+            if self.path != ":memory:":
+                connection.close()
+        quality = ParseQuality()
+        pages = 0
+        parents = 0
+        children = 0
+        next_page = 1
+        for row in rows:
+            if row["start_page"] > 0 and row["start_page"] != next_page:
+                break
+            pages += max(row["end_page"] - row["start_page"] + 1, 0)
+            parents += row["parent_count"] or 0
+            children += row["child_count"] or 0
+            if row["start_page"] > 0:
+                next_page = row["end_page"] + 1
+            if row["quality_json"]:
+                quality = quality.merge(ParseQuality(**json.loads(row["quality_json"])))
+        return {
+            "windows": len(rows),
+            "pages": pages,
+            "parents": parents,
+            "children": children,
+            "quality": quality,
+        }
 
     def record_batch(
         self,

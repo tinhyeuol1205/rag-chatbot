@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 from secrets import compare_digest
+from typing import Literal
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -87,10 +89,18 @@ app.add_middleware(
 
 # --- Request/Response Models ---
 
+class HistoryMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=2000)
+
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(min_length=1, max_length=2000)   # ★ chặn query khổng lồ
+    history: list[HistoryMessage] = Field(default_factory=list, max_length=16)
 
 
 class SourceResponse(BaseModel):
@@ -141,6 +151,19 @@ def _result_from_payload(payload: object):
         expanded_queries=list(data.get("expanded_queries", []) or []),
         num_candidates=int(data.get("num_candidates", 0)),
     )
+
+
+def _history_pairs(history: list[HistoryMessage]) -> list[tuple[str, str]]:
+    """Convert typed API messages into the retriever's bounded turn format."""
+    pairs: list[tuple[str, str]] = []
+    pending_user: str | None = None
+    for message in history[-settings.UI_HISTORY_MAX_TURNS * 2 :]:
+        if message.role == "user":
+            pending_user = message.content.strip()
+        elif pending_user:
+            pairs.append((pending_user, message.content.strip()))
+            pending_user = None
+    return pairs
 
 
 async def _submit_chat(
@@ -212,10 +235,14 @@ async def health_check():
 @app.get("/ready")
 async def readiness_check():
     """Readiness for Redis admission, GPU services and the active Qdrant schema."""
+    worker_available = False
     try:
         if settings.RAG_EXECUTION_MODE == "redis_worker":
             queue = get_admission_queue()
             queue.client.ping()
+            worker_available = queue.worker_available()
+            if not worker_available:
+                raise ValueError("RAG worker heartbeat is missing")
         connector = QdrantConnector()
         child = connector.alias_target(settings.CHILD_COLLECTION)
         parent = connector.alias_target(settings.PARENT_COLLECTION)
@@ -248,7 +275,16 @@ async def readiness_check():
             status_code=503,
             detail={"code": "not_ready", "message": "Hệ thống chưa sẵn sàng phục vụ"},
         ) from exc
-    return {"status": "ready", "child_collection": child, "parent_collection": parent}
+    return {
+        "status": "ready",
+        "app_env": settings.APP_ENV,
+        "execution_mode": settings.RAG_EXECUTION_MODE,
+        "embedding_runtime": settings.EMBEDDING_RUNTIME,
+        "reranker_runtime": settings.RERANKER_RUNTIME,
+        "worker_available": worker_available,
+        "child_collection": child,
+        "parent_collection": parent,
+    }
 
 
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])
@@ -261,7 +297,11 @@ async def chat_endpoint(
     Chỉ enqueue/wait ở API; worker mới chạy RAG sau Redis admission.
     """
     try:
-        result = await _submit_chat(request.query, idempotency_key=idempotency_key)
+        result = await _submit_chat(
+            request.query,
+            _history_pairs(request.history),
+            idempotency_key=idempotency_key,
+        )
         return ChatResponse(
             answer=result.answer,
             sources=[SourceResponse(**source.as_dict()) for source in result.sources],
@@ -312,15 +352,16 @@ async def chat_stream_endpoint(
     """
     queue = get_admission_queue()
     pending_job = None
+    history = _history_pairs(request.history)
     if not isinstance(queue, InlineAdmissionQueue):
         try:
             if idempotency_key is None:
-                pending_job = await asyncio.to_thread(queue.enqueue, request.query, [])
+                pending_job = await asyncio.to_thread(queue.enqueue, request.query, history)
             else:
                 pending_job = await asyncio.to_thread(
                     queue.enqueue,
                     request.query,
-                    [],
+                    history,
                     idempotency_key=idempotency_key,
                 )
         except QueueFullError as exc:
@@ -346,23 +387,61 @@ async def chat_stream_endpoint(
                     queue.execute,
                     _run_stream_job,
                     request.query,
-                    [],
+                    history,
                 )
+                for item in events:
+                    event_name, data = _normalise_event(item)
+                    yield {
+                        "event": event_name,
+                        "data": json.dumps(data, ensure_ascii=False),
+                    }
             else:
-                try:
-                    payload = await asyncio.to_thread(queue.wait_result, pending_job.job_id, settings.RAG_JOB_MAX_WAIT_SECONDS)
-                except JobTimeoutError:
-                    await asyncio.to_thread(queue.cancel, pending_job.job_id)
-                    raise
-                events = _result_events(_result_from_payload(payload))
-            for item in events:
-                event_name, data = _normalise_event(item)
-                yield {
-                    "event": event_name,
-                    "data": json.dumps(data, ensure_ascii=False),
-                }
+                events = []
+                last_id = "0-0"
+                deadline = time.monotonic() + settings.RAG_JOB_MAX_WAIT_SECONDS
+                terminal = False
+                while time.monotonic() < deadline and not terminal:
+                    new_events, state = await asyncio.to_thread(
+                        queue.read_events,
+                        pending_job.job_id,
+                        last_id=last_id,
+                        block_ms=min(500, max(50, int((deadline - time.monotonic()) * 1000))),
+                    )
+                    for item in new_events:
+                        events.append(item)
+                        last_id = str(item.get("id", last_id))
+                        event_name, data = _normalise_event(item)
+                        payload = {
+                            "event": event_name,
+                            "data": json.dumps(data, ensure_ascii=False),
+                        }
+                        if item.get("id"):
+                            payload["id"] = str(item["id"])
+                        yield payload
+                        if event_name == "end":
+                            terminal = True
+                            break
+                    if terminal:
+                        break
+                    if state in {"failed", "cancelled"} and not new_events:
+                        yield {
+                            "event": "error",
+                            "data": json.dumps(
+                                {
+                                    "code": "job_failed" if state == "failed" else "job_timeout",
+                                    "message": USER_FACING_ERROR,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                        terminal_event = {"event": "end", "data": {}}
+                        events.append(terminal_event)
+                        yield {"event": "end", "data": "{}"}
+                        terminal = True
+                if not terminal:
+                    raise JobTimeoutError("RAG job result wait timed out")
             last_event = events[-1] if events else None
-            if not isinstance(last_event, dict) or last_event.get("event") != "end":
+            if not isinstance(last_event, dict) or _normalise_event(last_event)[0] != "end":
                 yield {"event": "end", "data": "{}"}
         except RAGChatbotError as exc:
             yield {

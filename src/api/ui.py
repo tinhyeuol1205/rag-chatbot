@@ -1,28 +1,25 @@
-"""
-Gradio Chat UI — Giao diện chat trực quan.
+"""Gradio thin UI for the FastAPI-backed dev/product demos.
 
-Features:
-  - Chat interface với streaming response
-  - Hiển thị tên dự án và mô tả
-  - Ví dụ câu hỏi mẫu để user thử nhanh
-
-Chạy bằng: make run-ui
-Hoặc:      cd src && python -m api.ui
+Run with ``make run-ui UI_DEMO_MODE=dev`` or
+``make run-ui UI_DEMO_MODE=product``.  This module intentionally contains no
+retriever, Qdrant, Redis queue, or model-runtime imports: FastAPI is the only
+backend boundary visible to the browser-facing UI process.
 """
 
 from __future__ import annotations
 
+import html
+from collections.abc import Iterable, Iterator
+from typing import Any
+
 import gradio as gr
 
-from api.chat import _normalize_history, chat_stream_events, get_retriever
+from api.ui_client import UIAPIClient, UIClientError, normalize_history, sanitize_sources
 from core import get_logger
-from core.admission_queue import InlineAdmissionQueue, get_admission_queue
 from core.config import settings
-from core.errors import RAGChatbotError
 
 logger = get_logger(__name__)
 
-# Câu hỏi mẫu để user thử nhanh
 EXAMPLE_QUESTIONS = [
     "How many days of annual leave do employees get?",
     "What equipment does the company provide for remote workers?",
@@ -33,116 +30,126 @@ EXAMPLE_QUESTIONS = [
     "How many code review approvals are needed?",
 ]
 
+_client: UIAPIClient | None = None
 
-def respond(message: str, chat_history: list):
-    """Xử lý message từ user, trả về streaming response (multi-turn).
 
-    Args:
-        message: Tin nhắn mới từ user
-        chat_history: Lịch sử chat (Gradio format) — dùng để condense follow-up
+def get_ui_client() -> UIAPIClient:
+    """Create one HTTP client per UI process and reuse its connection pool."""
+    global _client
+    if _client is None:
+        _client = UIAPIClient()
+    return _client
 
-    Yields:
-        Từng token để Gradio hiển thị streaming
-    """
-    # The UI is also an entry point.  Route it through the same admission
-    # boundary as FastAPI so Gradio's own unbounded queue cannot bypass the
-    # provider quota in production.  The Redis path returns a completed result
-    # (the API SSE endpoint remains the preferred streaming client).
-    history = _normalize_history(chat_history or [])
-    queue = get_admission_queue()
-    try:
-        if isinstance(queue, InlineAdmissionQueue):
-            events = queue.execute(
-                lambda query, pairs: list(chat_stream_events(query, history=pairs)),
-                message,
-                history,
-            )
-        else:
-            job = queue.enqueue(message, history)
-            payload = queue.wait_result(job.job_id)
-            events = [
-                {"event": "token", "data": payload.get("answer", "")},
-                {"event": "sources", "data": payload.get("sources", [])},
-                {"event": "end", "data": {}},
-            ]
-    except RAGChatbotError as exc:
-        yield f"⚠️ {exc.public_message}"
-        return
-    except Exception:
-        logger.exception("UI request failed")
-        yield "Xin lỗi, hệ thống đang bận. Vui lòng thử lại sau."
-        return
 
-    # Streaming: ghép token và render sources sau khi generation kết thúc.
+def respond(
+    message: str,
+    chat_history: Iterable[Any] | None,
+    *,
+    client: UIAPIClient | None = None,
+) -> Iterator[str]:
+    """Yield the accumulated answer as FastAPI SSE token events arrive."""
+    api = client or get_ui_client()
+    history = normalize_history(chat_history, max_turns=settings.UI_HISTORY_MAX_TURNS)
     response = ""
-    for event in events:
-        if isinstance(event, str):
-            # Tương thích với caller/test cũ nếu event adapter bị thay thế.
-            response += event
-        elif event.get("event") == "token":
-            token = event.get("data", "")
-            response += str(token.get("text", "") if isinstance(token, dict) else token)
-        elif event.get("event") == "sources":
-            sources = event.get("data", [])
-            if isinstance(sources, dict):
-                sources = sources.get("sources", [])
-            response += _format_sources(sources)
-        elif event.get("event") == "error":
-            error = event.get("data", {})
-            if isinstance(error, dict):
-                message_text = error.get("message", "An unexpected error occurred.")
-            else:
-                message_text = str(error) if error else "An unexpected error occurred."
-            response += f"\n\n⚠️ {message_text}"
-        yield response
+    try:
+        for event in api.stream(message, history):
+            event_name = event.get("event", "message")
+            data = event.get("data", {})
+            if event_name == "token":
+                token = data.get("text", "") if isinstance(data, dict) else data
+                response += str(token)
+            elif event_name == "sources":
+                source_rows = data.get("sources", []) if isinstance(data, dict) else data
+                response += _format_sources(sanitize_sources(source_rows))
+            elif event_name == "error":
+                response += f"\n\n⚠️ {_error_text(data)}"
+            if event_name in {"token", "sources", "error"}:
+                yield response
+    except UIClientError as exc:
+        retry_hint = f" (Retry-After: {exc.retry_after}s)" if exc.retry_after else ""
+        logger.warning("UI API request failed", error_code=exc.code, status_code=exc.status_code)
+        yield f"⚠️ {exc.message}{retry_hint}"
+    except Exception:
+        logger.exception("UI callback failed")
+        yield "⚠️ Không thể kết nối tới API. Vui lòng thử lại sau."
 
 
-def _format_sources(sources: list[dict]) -> str:
-    """Render source metadata thành Markdown ở cuối câu trả lời."""
+def _format_sources(sources: list[dict[str, Any]]) -> str:
+    """Render only allowlisted, escaped citation metadata as plain Markdown."""
     if not sources:
         return ""
     lines = ["\n\nSources:"]
     for source in sources:
-        parts = [source.get("file_name") or "Unknown"]
-        if source.get("section_title"):
-            parts.append(source["section_title"])
+        parts = [html.escape(str(source.get("file_name", "Unknown")))]
+        section = source.get("section_title")
+        if section:
+            parts.append(html.escape(str(section)))
         if source.get("page_number") is not None:
-            parts.append(f"p.{source['page_number']}")
-        lines.append(f"- [{source.get('citation_id')}] {' → '.join(parts)}")
+            parts.append(f"p.{html.escape(str(source['page_number']))}")
+        citation = html.escape(str(source.get("citation_id", "?")))
+        lines.append(f"- [{citation}] {' → '.join(parts)}")
     return "\n".join(lines)
 
 
-def create_ui() -> gr.ChatInterface:
-    """Tạo Gradio ChatInterface."""
+def _error_text(data: Any) -> str:
+    """Extract a safe API error message and preserve retry guidance."""
+    if isinstance(data, dict):
+        message = str(data.get("message", "Yêu cầu không hoàn tất."))
+    else:
+        message = str(data or "Yêu cầu không hoàn tất.")
+    return message
+
+
+def create_ui(client: UIAPIClient | None = None) -> gr.ChatInterface:
+    """Create the Gradio view; all backend calls remain in ``UIAPIClient``."""
+    api = client or get_ui_client()
+
+    def respond_from_gradio(message: str, history: list[Any]):
+        yield from respond(message, history, client=api)
 
     demo = gr.ChatInterface(
-        fn=respond,
+        fn=respond_from_gradio,
         title="🤖 RAG Chatbot — Internal Knowledge Base",
-        description="Ask questions about company policies and engineering practices.\nPowered by **Advanced RAG** (Hybrid Search, Reranking, Parent-Child Retrieval).",
+        description=(
+            "Ask questions about company policies and engineering practices.\n"
+            "Powered by **FastAPI + Advanced RAG**."
+        ),
         examples=EXAMPLE_QUESTIONS,
         cache_examples=False,
     )
-    # Keep Gradio's front-door queue bounded as well.  It is not the provider
-    # limiter (Redis is authoritative), but prevents an unbounded UI backlog.
+    # This is only a small browser/UI transport bound.  Redis admission and the
+    # provider quota remain authoritative in product mode; Gradio never calls
+    # the RAG pipeline directly.
     demo.queue(
         max_size=settings.RAG_QUEUE_MAX_OUTSTANDING,
         default_concurrency_limit=settings.RAG_WORKER_CONCURRENCY,
     )
-
     return demo
 
 
-def main():
-    logger.info("Starting Gradio UI")
-    # Fail-fast: config/model errors hiện ở đây, không phải request đầu tiên
-    # (bug P2-14 — warmup load embedding/reranker model 1 lần).
-    get_retriever().warmup()
-    demo = create_ui()
-    demo.launch(
-        server_name="localhost",
-        server_port=7860,
-        share=False,
+def main() -> None:
+    """Validate topology before listening, then launch the configured UI."""
+    api = get_ui_client()
+    state = api.preflight(settings.UI_DEMO_MODE)
+    logger.info(
+        "Starting thin RAG UI",
+        demo_mode=settings.UI_DEMO_MODE,
+        execution_mode=state.execution_mode,
+        api_base_url=settings.UI_API_BASE_URL,
     )
+    auth = None
+    if settings.UI_AUTH_USERNAME and settings.UI_AUTH_PASSWORD:
+        auth = (settings.UI_AUTH_USERNAME, settings.UI_AUTH_PASSWORD)
+    try:
+        create_ui(api).launch(
+            server_name=settings.UI_HOST,
+            server_port=settings.UI_PORT,
+            share=settings.UI_PUBLIC_SHARE,
+            auth=auth,
+            show_error=False,
+        )
+    finally:
+        api.close()
 
 
 if __name__ == "__main__":

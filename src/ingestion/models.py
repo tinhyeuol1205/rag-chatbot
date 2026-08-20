@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel
@@ -75,6 +76,29 @@ class ParseQuality(BaseModel):
 
     def as_dict(self) -> dict[str, int]:
         return self.model_dump()
+
+
+@dataclass
+class ParseWindow:
+    """Bounded parser output consumed by the ingestion pipeline.
+
+    PDF page numbers are one-based. Non-paged parsers use ``0`` for both
+    values while retaining the same streaming contract.
+    """
+
+    start_page: int
+    end_page: int
+    documents: list[RawDocument]
+    quality: ParseQuality
+    estimated_bytes: int = 0
+    ocr_pages: tuple[int, ...] = ()
+    ordinal: int = 0
+
+    @property
+    def key(self) -> str:
+        if self.start_page > 0:
+            return f"pdf:{self.start_page:06d}-{self.end_page:06d}"
+        return f"document:{self.ordinal:06d}"
 
 
 class Chunk(BaseModel):
