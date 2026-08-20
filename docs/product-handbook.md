@@ -537,10 +537,17 @@ tenant thay vì chỉ filter payload.
 
 ### 9.3 Tài liệu lớn hoặc PDF OCR
 
+- PR16 nhận trực tiếp một PDF 1000+ trang; không cần tách file ở upstream.
 - Kiểm tra `INGEST_MAX_MEMORY_MB`, disk tạm và RSS trước khi chạy batch lớn.
-- Tách file quá lớn theo page/section ở upstream nếu parser/OCR vượt memory.
+- Dùng `INGEST_PDF_PAGE_WINDOW=16`, `INGEST_PDF_OCR_PAGE_WINDOW=4` làm baseline;
+  chỉ tăng sau khi load test trên layout/image size thật.
+- Fast parse chạy theo window; OCR chỉ fill trang thiếu. Element thiếu metadata
+  trang sẽ fail closed để không tạo citation sai.
 - Chạy ingest ngoài giờ cao điểm và giới hạn số job đồng thời.
 - Không dùng cùng một generation cho hai lần ingest có nội dung khác nhau.
+
+Chi tiết command, resume và rollback xem tại
+[docs/ingestion-pr16-large-pdf.md](ingestion-pr16-large-pdf.md).
 
 ### 9.4 Mã sản phẩm, acronym và bảng
 

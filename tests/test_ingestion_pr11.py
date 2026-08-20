@@ -85,6 +85,70 @@ def test_manifest_skip_requires_content_and_pipeline_fingerprint():
     ) == ["p1"]
 
 
+def test_manifest_window_checkpoint_resume_is_fingerprint_scoped():
+    store = ManifestStore(":memory:")
+    store.record_window(
+        dataset_id="docs",
+        generation_id="g1",
+        source_uri="large.pdf",
+        content_sha256="hash-a",
+        fingerprint="fp-a",
+        window_key="pdf:000001-000016",
+        start_page=1,
+        end_page=16,
+        parent_count=2,
+        child_count=4,
+        parent_batch_keys=["large.pdf:pdf:000001-000016:parent:0"],
+        child_batch_keys=["large.pdf:pdf:000001-000016:child:0"],
+        quality={"pages_seen": 16, "documents_emitted": 16, "characters_emitted": 100},
+    )
+
+    assert store.resume_page(
+        dataset_id="docs",
+        generation_id="g1",
+        source_uri="large.pdf",
+        content_sha256="hash-a",
+        fingerprint="fp-a",
+    ) == 17
+    assert store.get_window(
+        dataset_id="docs",
+        generation_id="g1",
+        source_uri="large.pdf",
+        content_sha256="hash-a",
+        fingerprint="other-fingerprint",
+        window_key="pdf:000001-000016",
+    ) is None
+
+
+def test_versioned_dry_run_does_not_require_qdrant(tmp_path):
+    class FailIfContacted:
+        def alias_target(self, _name):
+            raise AssertionError("dry-run must not contact Qdrant")
+
+    class FakeEmbedder:
+        dimension = 384
+
+    pipeline = IngestionPipeline.__new__(IngestionPipeline)
+    pipeline.qdrant = FailIfContacted()
+    pipeline.embedder = FakeEmbedder()
+    pipeline.manifest = ManifestStore(":memory:")
+    (tmp_path / "doc.md").write_text(
+        "# Policy\n\nThis content is long enough for the parser quality gate.",
+        encoding="utf-8",
+    )
+
+    result = pipeline.run(
+        str(tmp_path),
+        sync=True,
+        dry_run=True,
+        job_id="dry-run-no-qdrant",
+        generation_id="dry-run-no-qdrant",
+    )
+
+    assert result.dry_run is True
+    assert result.failed_files == set()
+
+
 def test_markdown_stream_supports_tilde_fences_and_structural_anchor(tmp_path):
     path = tmp_path / "doc.md"
     path.write_text(

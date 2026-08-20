@@ -52,6 +52,11 @@ class Settings(BaseSettings):
             "INGEST_QDRANT_MAX_RETRIES": self.INGEST_QDRANT_MAX_RETRIES,
             "INGEST_GENERATION_RETENTION": self.INGEST_GENERATION_RETENTION,
             "INGEST_MAX_MEMORY_MB": self.INGEST_MAX_MEMORY_MB,
+            "INGEST_PDF_PAGE_WINDOW": self.INGEST_PDF_PAGE_WINDOW,
+            "INGEST_PDF_OCR_PAGE_WINDOW": self.INGEST_PDF_OCR_PAGE_WINDOW,
+            "INGEST_PDF_MAX_PAGES": self.INGEST_PDF_MAX_PAGES,
+            "INGEST_PDF_SPOOL_MAX_MB": self.INGEST_PDF_SPOOL_MAX_MB,
+            "INGEST_PDF_WINDOW_TIMEOUT_SECONDS": self.INGEST_PDF_WINDOW_TIMEOUT_SECONDS,
             "RAG_QUEUE_MAX_OUTSTANDING": self.RAG_QUEUE_MAX_OUTSTANDING,
             "RAG_JOB_MAX_WAIT_SECONDS": self.RAG_JOB_MAX_WAIT_SECONDS,
             "RAG_JOB_TTL_SECONDS": self.RAG_JOB_TTL_SECONDS,
@@ -81,6 +86,14 @@ class Settings(BaseSettings):
         invalid = [name for name, value in positive_limits.items() if value <= 0]
         if invalid:
             raise ConfigurationError(f"Ingestion limits must be positive: {invalid}")
+        if self.INGEST_PDF_OCR_PAGE_WINDOW > self.INGEST_PDF_PAGE_WINDOW:
+            raise ConfigurationError(
+                "INGEST_PDF_OCR_PAGE_WINDOW cannot exceed INGEST_PDF_PAGE_WINDOW"
+            )
+        if self.INGEST_PDF_OCR_MODE not in {"never", "missing_pages", "always"}:
+            raise ConfigurationError(
+                "INGEST_PDF_OCR_MODE must be never, missing_pages or always"
+            )
         retry_delays = {
             "INGEST_RETRY_BASE_SECONDS": self.INGEST_RETRY_BASE_SECONDS,
             "INGEST_RETRY_MAX_SECONDS": self.INGEST_RETRY_MAX_SECONDS,
@@ -284,6 +297,12 @@ class Settings(BaseSettings):
     INGEST_FAIL_ON_QUALITY: bool = True
     INGEST_PDF_FAST_STRATEGY: str = "fast"
     INGEST_PDF_OCR_STRATEGY: str = "hi_res"
+    INGEST_PDF_PAGE_WINDOW: int = 16
+    INGEST_PDF_OCR_PAGE_WINDOW: int = 4
+    INGEST_PDF_OCR_MODE: str = "missing_pages"
+    INGEST_PDF_MAX_PAGES: int = 5000
+    INGEST_PDF_SPOOL_MAX_MB: int = 64
+    INGEST_PDF_WINDOW_TIMEOUT_SECONDS: int = 300
 
     # --- Qdrant native BM25 / server-side hybrid retrieval ---
     QDRANT_SPARSE_VECTOR_NAME: str = "bm25"

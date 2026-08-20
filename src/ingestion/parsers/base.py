@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from pathlib import Path
 
-from ingestion.models import ParseQuality, RawDocument
+from ingestion.models import ParseQuality, ParseWindow, RawDocument
 
 
 class BaseParser(ABC):
@@ -28,6 +28,36 @@ class BaseParser(ABC):
     def iter_documents(self, file_path: Path) -> Iterator[RawDocument]:
         """Stream parsed documents; legacy parsers are wrapped by default."""
         yield from self.parse(file_path)
+
+    def iter_windows(
+        self,
+        file_path: Path,
+        *,
+        start_page: int | None = None,
+    ) -> Iterator[ParseWindow]:
+        """Yield bounded windows for production ingestion.
+
+        PDFParser overrides this with page windows. Other parsers are adapted
+        one document at a time so the pipeline never needs a corpus-sized list.
+        ``parse`` and ``parse_with_quality`` remain materializing compatibility
+        APIs for existing callers and tests.
+        """
+        del start_page
+        for ordinal, document in enumerate(self.iter_documents(file_path)):
+            quality = ParseQuality(
+                documents_emitted=1,
+                characters_emitted=len(document.content),
+                elements_seen=1,
+                replacement_characters=document.content.count("\ufffd"),
+            )
+            yield ParseWindow(
+                start_page=0,
+                end_page=0,
+                documents=[document],
+                quality=quality,
+                estimated_bytes=len(document.content.encode("utf-8")) * 2 + 1024,
+                ordinal=ordinal,
+            )
 
     def parse_with_quality(self, file_path: Path) -> tuple[list[RawDocument], ParseQuality]:
         """Compatibility helper returning documents plus baseline quality counters."""

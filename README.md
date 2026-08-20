@@ -227,6 +227,8 @@ runbook triển khai PR14 tại
 Handbook vận hành từ đầu, ingest dữ liệu mới và các workflow product xem tại
 [docs/product-handbook.md](docs/product-handbook.md).
 
+Với một PDF lớn (1000+ trang), xem [runbook PR16](docs/ingestion-pr16-large-pdf.md).
+
 ## 🗺️ Port Map
 
 | Service | Port | Ghi chú |

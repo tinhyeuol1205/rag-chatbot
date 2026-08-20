@@ -26,6 +26,8 @@ dependencies = [
 
     # Document parsing (PDF, DOCX, MD)
     "unstructured[pdf,docx,md]>=0.14,<0.25",
+    "pypdf>=6.0,<7",
+    "psutil>=5.9,<8",
 
     # Text splitting
     "langchain-text-splitters>=0.2,<0.4",
