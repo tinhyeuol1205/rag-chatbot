@@ -106,7 +106,7 @@ class CrossEncoderReranker:
         pairs = [(query, doc["content"]) for doc in candidates]
 
         if self.is_remote:
-            scores = self._remote_predict(query, [doc["content"] for doc in candidates])
+            scores = self._remote_predict(query, [doc["content"] for doc in candidates], priority="online")
         else:
             # Local adapter only. GPU service concurrency is owned by the
             # inference deployment, not by an API-process limiter.
@@ -131,16 +131,23 @@ class CrossEncoderReranker:
         return top_docs
 
     @staticmethod
-    def _remote_predict(query: str, documents: list[str]) -> list[float]:
+    def _remote_predict(query: str, documents: list[str], *, priority: str = "online") -> list[float]:
         url = settings.RERANKER_BASE_URL.rstrip("/") + "/rerank"
         payload = {
             "model": settings.RERANKER_MODEL_ID,
             "revision": settings.RERANKER_MODEL_REVISION,
             "query": query,
             "documents": documents,
+            "priority": priority if priority in {"online", "batch"} else "online",
         }
+        headers = {}
+        if settings.MODEL_SERVER_API_KEY:
+            headers["X-API-Key"] = settings.MODEL_SERVER_API_KEY
         try:
-            response = httpx.post(url, json=payload, timeout=settings.RERANKER_HTTP_TIMEOUT_SECONDS)
+            request_kwargs = {"json": payload, "timeout": settings.RERANKER_HTTP_TIMEOUT_SECONDS}
+            if headers:
+                request_kwargs["headers"] = headers
+            response = httpx.post(url, **request_kwargs)
             response.raise_for_status()
             body = response.json()
         except Exception as exc:

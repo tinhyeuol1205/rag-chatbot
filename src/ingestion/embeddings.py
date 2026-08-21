@@ -82,7 +82,7 @@ class EmbeddingService:
             )
         return int(dimension)
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], *, priority: str = "online") -> list[list[float]]:
         """Embed danh sách text → danh sách vectors.
 
         Args:
@@ -94,7 +94,7 @@ class EmbeddingService:
         if not texts:
             return []
         if self.is_remote:
-            return self._embed_remote(texts)
+            return self._embed_remote(texts, priority=priority)
         vectors = self._encode_with_retry(texts)
         array = np.asarray(vectors, dtype=np.float32)
         if array.ndim != 2 or array.shape[1] != self.dimension:
@@ -122,18 +122,18 @@ class EmbeddingService:
         for text in texts:
             pending.append(text)
             if len(pending) >= size:
-                yield self._encode_batch(pending)
+                yield self._encode_batch(pending, priority="batch")
                 pending = []
         if pending:
-            yield self._encode_batch(pending)
+            yield self._encode_batch(pending, priority="batch")
 
     def embed_single(self, text: str) -> list[float]:
         """Embed 1 text duy nhất → 1 vector."""
         return self.embed([text])[0]
 
-    def _encode_batch(self, texts: list[str]) -> np.ndarray:
+    def _encode_batch(self, texts: list[str], *, priority: str = "batch") -> np.ndarray:
         if self.is_remote:
-            return np.asarray(self._embed_remote(texts), dtype=np.float32)
+            return np.asarray(self._embed_remote(texts, priority=priority), dtype=np.float32)
         vectors = self._encode_with_retry(texts)
         array = np.asarray(vectors, dtype=np.float32)
         if array.ndim != 2 or array.shape[1] != self.dimension:
@@ -174,7 +174,7 @@ class EmbeddingService:
                 )
                 time.sleep(delay)
 
-    def _embed_remote(self, texts: list[str]) -> list[list[float]]:
+    def _embed_remote(self, texts: list[str], *, priority: str = "online") -> list[list[float]]:
         """Call the pinned GPU embedding service contract.
 
         Accepted response shapes are the common TEI-style list of vectors and
@@ -186,9 +186,16 @@ class EmbeddingService:
             "model": settings.EMBEDDING_MODEL_ID,
             "revision": settings.EMBEDDING_MODEL_REVISION or settings.INGEST_EMBEDDING_MODEL_REVISION,
             "normalize": settings.EMBEDDING_NORMALIZE,
+            "priority": priority if priority in {"online", "batch"} else "online",
         }
+        headers = {}
+        if settings.MODEL_SERVER_API_KEY:
+            headers["X-API-Key"] = settings.MODEL_SERVER_API_KEY
         try:
-            response = httpx.post(url, json=payload, timeout=settings.EMBEDDING_HTTP_TIMEOUT_SECONDS)
+            request_kwargs = {"json": payload, "timeout": settings.EMBEDDING_HTTP_TIMEOUT_SECONDS}
+            if headers:
+                request_kwargs["headers"] = headers
+            response = httpx.post(url, **request_kwargs)
             response.raise_for_status()
             body = response.json()
         except Exception as exc:

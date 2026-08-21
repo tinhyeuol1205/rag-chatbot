@@ -3542,6 +3542,7 @@ dependencies = [
     { name = "sentence-transformers" },
     { name = "sse-starlette" },
     { name = "structlog" },
+    { name = "torch" },
     { name = "unstructured", version = "0.18.32", source = { registry = "https://pypi.org/simple" }, extra = ["docx", "md", "pdf"], marker = "python_full_version < '3.11'" },
     { name = "unstructured", version = "0.24.1", source = { registry = "https://pypi.org/simple" }, extra = ["docx", "md", "pdf"], marker = "python_full_version >= '3.11'" },
     { name = "uvicorn", extra = ["standard"] },
@@ -3576,6 +3577,7 @@ requires-dist = [
     { name = "sentence-transformers", specifier = ">=3.0,<6" },
     { name = "sse-starlette", specifier = ">=2.0,<4" },
     { name = "structlog", specifier = ">=24.1,<27" },
+    { name = "torch", specifier = ">=2.3,<3" },
     { name = "unstructured", extras = ["pdf", "docx", "md"], specifier = ">=0.14,<0.25" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
 ]
