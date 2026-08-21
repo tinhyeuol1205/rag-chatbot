@@ -229,6 +229,11 @@ Handbook vận hành từ đầu, ingest dữ liệu mới và các workflow pro
 
 Với một PDF lớn (1000+ trang), xem [runbook PR16](docs/ingestion-pr16-large-pdf.md).
 
+Model server PR17 cho macOS Apple Silicon được mô tả tại
+[docs/model-server-pr17.md](docs/model-server-pr17.md). Đây là process FastAPI
+độc lập chạy BGE-M3 và bge-reranker-v2-m3 với dynamic batching bounded; RAG API
+vẫn gọi qua hợp đồng remote `/embed` và `/rerank`.
+
 ## 🗺️ Port Map
 
 | Service | Port | Ghi chú |
@@ -238,6 +243,7 @@ Với một PDF lớn (1000+ trang), xem [runbook PR16](docs/ingestion-pr16-larg
 | LLM server (vLLM / NIM) | 8000 | trỏ bởi `OPENAI_BASE_URL` |
 | Embedding GPU service | 8080 | `EMBEDDING_BASE_URL`, BGE-M3 |
 | Reranker GPU service | 8080 | `RERANKER_BASE_URL`, BGE-Reranker-v2-m3 |
+| PR17 Apple Silicon model server | 8082 | `make run-model-server`, one worker |
 | FastAPI backend | 8080 | `make run-api` |
 | Gradio UI | 7860 | `make run-ui` |
 

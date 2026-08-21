@@ -21,13 +21,10 @@ from core.config import settings
 logger = get_logger(__name__)
 
 EXAMPLE_QUESTIONS = [
-    "How many days of annual leave do employees get?",
-    "What equipment does the company provide for remote workers?",
-    "What is the Git branching strategy?",
-    "How should security incidents be reported?",
-    "What happens during the first day of onboarding?",
-    "What is the password policy?",
-    "How many code review approvals are needed?",
+    "Các chiêu thức trong Hàng long thập bát chưởng là gì?",
+    "Mối quan hệ giữa Nhất Đăng đại sư, Lưu Anh và Chu bá Thông là gì?",
+    "Ngũ tuyệt bao gồm những ai?",
+    "Ai là người có võ công cao cường nhất trong Ngũ Tuyệt?",
 ]
 
 _client: UIAPIClient | None = None
@@ -111,7 +108,7 @@ def create_ui(client: UIAPIClient | None = None) -> gr.ChatInterface:
         fn=respond_from_gradio,
         title="🤖 RAG Chatbot — Internal Knowledge Base",
         description=(
-            "Ask questions about company policies and engineering practices.\n"
+            "Ask questions about the internal knowledge base.\n"
             "Powered by **FastAPI + Advanced RAG**."
         ),
         examples=EXAMPLE_QUESTIONS,

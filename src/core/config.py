@@ -82,6 +82,23 @@ class Settings(BaseSettings):
             "UI_HISTORY_MAX_TURNS": self.UI_HISTORY_MAX_TURNS,
             "REDIS_JOB_EVENT_TTL_SECONDS": self.REDIS_JOB_EVENT_TTL_SECONDS,
             "RAG_WORKER_HEARTBEAT_TTL_SECONDS": self.RAG_WORKER_HEARTBEAT_TTL_SECONDS,
+            "MODEL_SERVER_PORT": self.MODEL_SERVER_PORT,
+            "MODEL_SERVER_WORKERS": self.MODEL_SERVER_WORKERS,
+            "MODEL_SERVER_MAX_BODY_BYTES": self.MODEL_SERVER_MAX_BODY_BYTES,
+            "MODEL_SERVER_MAX_PENDING_REQUESTS": self.MODEL_SERVER_MAX_PENDING_REQUESTS,
+            "MODEL_SERVER_MAX_PENDING_ITEMS": self.MODEL_SERVER_MAX_PENDING_ITEMS,
+            "MODEL_SERVER_MAX_PENDING_BYTES": self.MODEL_SERVER_MAX_PENDING_BYTES,
+            "MODEL_SERVER_QUEUE_TIMEOUT_SECONDS": self.MODEL_SERVER_QUEUE_TIMEOUT_SECONDS,
+            "MODEL_SERVER_MPS_MAX_INFLIGHT_BATCHES": self.MODEL_SERVER_MPS_MAX_INFLIGHT_BATCHES,
+            "MODEL_SERVER_ONLINE_MAX_BURST_BATCHES": self.MODEL_SERVER_ONLINE_MAX_BURST_BATCHES,
+            "MODEL_SERVER_MAX_ITEMS_PER_REQUEST_PER_BATCH": self.MODEL_SERVER_MAX_ITEMS_PER_REQUEST_PER_BATCH,
+            "MODEL_SERVER_SHUTDOWN_GRACE_SECONDS": self.MODEL_SERVER_SHUTDOWN_GRACE_SECONDS,
+            "EMBEDDING_MAX_INPUT_TOKENS": self.EMBEDDING_MAX_INPUT_TOKENS,
+            "EMBEDDING_DYNAMIC_BATCH_MAX_ITEMS": self.EMBEDDING_DYNAMIC_BATCH_MAX_ITEMS,
+            "EMBEDDING_DYNAMIC_BATCH_MAX_TOKENS": self.EMBEDDING_DYNAMIC_BATCH_MAX_TOKENS,
+            "RERANKER_MAX_INPUT_TOKENS": self.RERANKER_MAX_INPUT_TOKENS,
+            "RERANKER_DYNAMIC_BATCH_MAX_ITEMS": self.RERANKER_DYNAMIC_BATCH_MAX_ITEMS,
+            "RERANKER_DYNAMIC_BATCH_MAX_TOKENS": self.RERANKER_DYNAMIC_BATCH_MAX_TOKENS,
         }
         invalid = [name for name, value in positive_limits.items() if value <= 0]
         if invalid:
@@ -139,6 +156,17 @@ class Settings(BaseSettings):
             raise ConfigurationError("EMBEDDING_RUNTIME=remote requires EMBEDDING_BASE_URL")
         if self.RERANKER_RUNTIME == "remote" and not self.RERANKER_BASE_URL.strip():
             raise ConfigurationError("RERANKER_RUNTIME=remote requires RERANKER_BASE_URL")
+        if self.MODEL_SERVER_DEVICE.lower() not in {"cpu", "mps"}:
+            raise ConfigurationError("MODEL_SERVER_DEVICE must be cpu or mps")
+        if self.MODEL_SERVER_BATCH_WAIT_MS < 0:
+            raise ConfigurationError("MODEL_SERVER_BATCH_WAIT_MS cannot be negative")
+        if self.MODEL_SERVER_ENABLED and self.MODEL_SERVER_WORKERS != 1:
+            raise ConfigurationError("PR17 model server must run exactly one worker per Mac")
+        if self.MODEL_SERVER_ENABLED and self.APP_ENV.lower() in {"production", "prod"}:
+            if self.MODEL_SERVER_DEVICE.lower() != "mps":
+                raise ConfigurationError("Production Apple Silicon model server requires MODEL_SERVER_DEVICE=mps")
+            if self.MODEL_SERVER_ALLOW_CPU_FALLBACK:
+                raise ConfigurationError("Production model server must fail closed instead of falling back to CPU")
         if self.APP_ENV.lower() in {"production", "prod"}:
             if self.RAG_EXECUTION_MODE != "redis_worker":
                 raise ConfigurationError("Production requires RAG_EXECUTION_MODE=redis_worker")
@@ -193,6 +221,34 @@ class Settings(BaseSettings):
     RERANKER_RUNTIME: str = "local"  # remote in production; local is dev/test adapter
     RERANKER_BASE_URL: str = "http://reranker-gpu:8080"
     RERANKER_HTTP_TIMEOUT_SECONDS: float = 30.0
+
+    # --- PR17 self-hosted Apple Silicon model server ---
+    # The API/worker keep using the remote contract above.  Enable these flags
+    # only in the process that actually hosts the models (normally one uvicorn
+    # worker on a Mac); API and worker processes may leave it disabled.
+    MODEL_SERVER_ENABLED: bool = False
+    MODEL_SERVER_HOST: str = "127.0.0.1"
+    MODEL_SERVER_PORT: int = 8082
+    MODEL_SERVER_DEVICE: str = "cpu"  # cpu | mps
+    MODEL_SERVER_WORKERS: int = 1
+    MODEL_SERVER_API_KEY: str = ""
+    MODEL_SERVER_MAX_BODY_BYTES: int = 4_000_000
+    MODEL_SERVER_MAX_PENDING_REQUESTS: int = 128
+    MODEL_SERVER_MAX_PENDING_ITEMS: int = 4_096
+    MODEL_SERVER_MAX_PENDING_BYTES: int = 32_000_000
+    MODEL_SERVER_QUEUE_TIMEOUT_SECONDS: float = 30.0
+    MODEL_SERVER_BATCH_WAIT_MS: int = 8
+    MODEL_SERVER_MPS_MAX_INFLIGHT_BATCHES: int = 1
+    MODEL_SERVER_ONLINE_MAX_BURST_BATCHES: int = 8
+    MODEL_SERVER_MAX_ITEMS_PER_REQUEST_PER_BATCH: int = 16
+    MODEL_SERVER_SHUTDOWN_GRACE_SECONDS: float = 30.0
+    MODEL_SERVER_ALLOW_CPU_FALLBACK: bool = False
+    EMBEDDING_MAX_INPUT_TOKENS: int = 1_024
+    EMBEDDING_DYNAMIC_BATCH_MAX_ITEMS: int = 64
+    EMBEDDING_DYNAMIC_BATCH_MAX_TOKENS: int = 8_192
+    RERANKER_MAX_INPUT_TOKENS: int = 512
+    RERANKER_DYNAMIC_BATCH_MAX_ITEMS: int = 32
+    RERANKER_DYNAMIC_BATCH_MAX_TOKENS: int = 8_192
 
     # --- API ---
     CORS_ORIGINS: list[str] = ["http://localhost:7860", "http://127.0.0.1:7860"]

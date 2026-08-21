@@ -256,19 +256,21 @@ async def readiness_check():
             require_sparse=True,
         )
         if settings.EMBEDDING_RUNTIME == "remote":
-            response = await asyncio.to_thread(
-                httpx.get,
-                settings.EMBEDDING_BASE_URL.rstrip("/") + "/health",
+            await _check_model_service(
+                settings.EMBEDDING_BASE_URL,
+                model_id=settings.EMBEDDING_MODEL_ID,
+                revision=settings.EMBEDDING_MODEL_REVISION or settings.INGEST_EMBEDDING_MODEL_REVISION,
+                dimension=settings.EMBEDDING_SIZE,
+                normalize=settings.EMBEDDING_NORMALIZE,
                 timeout=settings.EMBEDDING_HTTP_TIMEOUT_SECONDS,
             )
-            response.raise_for_status()
         if settings.RERANKER_RUNTIME == "remote":
-            response = await asyncio.to_thread(
-                httpx.get,
-                settings.RERANKER_BASE_URL.rstrip("/") + "/health",
+            await _check_model_service(
+                settings.RERANKER_BASE_URL,
+                model_id=settings.RERANKER_MODEL_ID,
+                revision=settings.RERANKER_MODEL_REVISION,
                 timeout=settings.RERANKER_HTTP_TIMEOUT_SECONDS,
             )
-            response.raise_for_status()
     except Exception as exc:
         logger.warning("Readiness check failed", error_type=type(exc).__name__)
         raise HTTPException(
@@ -285,6 +287,54 @@ async def readiness_check():
         "child_collection": child,
         "parent_collection": parent,
     }
+
+
+async def _check_model_service(
+    base_url: str,
+    *,
+    model_id: str,
+    revision: str,
+    dimension: int | None = None,
+    normalize: bool | None = None,
+    timeout: float,
+) -> None:
+    """Probe PR17 readiness/metadata when the native model server is enabled.
+
+    Older remote GPU deployments retain the PR14 ``/health`` contract unless
+    ``MODEL_SERVER_ENABLED=true``.  Enabling PR17 therefore becomes an
+    explicit schema gate instead of silently accepting a service with the
+    wrong model or vector dimension.
+    """
+    base = base_url.rstrip("/")
+    headers = {"X-API-Key": settings.MODEL_SERVER_API_KEY} if settings.MODEL_SERVER_API_KEY else None
+    def get(url: str):
+        kwargs = {"timeout": timeout}
+        if headers:
+            kwargs["headers"] = headers
+        return httpx.get(url, **kwargs)
+
+    if not settings.MODEL_SERVER_ENABLED:
+        response = await asyncio.to_thread(get, base + "/health")
+        response.raise_for_status()
+        return
+    ready = await asyncio.to_thread(get, base + "/ready")
+    ready.raise_for_status()
+    ready_body = ready.json()
+    if not isinstance(ready_body, dict) or ready_body.get("status") != "ready":
+        raise ValueError("model service did not report ready")
+    metadata = await asyncio.to_thread(get, base + "/metadata")
+    metadata.raise_for_status()
+    body = metadata.json()
+    if not isinstance(body, dict):
+        raise TypeError("model service metadata is invalid")
+    field = "embedding_model" if dimension is not None else "reranker_model"
+    revision_field = "embedding_revision" if dimension is not None else "reranker_revision"
+    if body.get(field) != model_id or body.get(revision_field, "") != revision:
+        raise ValueError("model server contract does not match configured model revision")
+    if dimension is not None and body.get("embedding_dimension") != dimension:
+        raise ValueError("embedding model dimension does not match Qdrant schema")
+    if normalize is not None and bool(body.get("embedding_normalize")) != bool(normalize):
+        raise ValueError("embedding normalize setting does not match model server")
 
 
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_api_key)])

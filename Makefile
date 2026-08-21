@@ -4,7 +4,7 @@ UV := $(shell command -v uv 2>/dev/null || echo /Users/binh.dv/.local/bin/uv)
 # Bắt uv sync đồng bộ vào đúng môi trường rag/ (thay vì tạo .venv mặc định)
 export UV_PROJECT_ENVIRONMENT := rag
 
-.PHONY: help install install-dev local-start local-stop ingest ingest-sync ingest-load run-api run-worker run-ui evaluate test lint check clean
+.PHONY: help install install-dev local-start local-stop ingest ingest-sync ingest-load run-api run-worker run-model-server load-model-server run-ui evaluate test lint check clean
 
 help: ## Hiển thị danh sách lệnh
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -52,6 +52,19 @@ run-api: ## Chạy FastAPI backend (mặc định 127.0.0.1:8080)
 
 run-worker: ## Chạy Redis Streams RAG worker (production mode)
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m workers.rag_worker
+
+MODEL_SERVER_HOST ?= 127.0.0.1
+MODEL_SERVER_PORT ?= 8082
+MODEL_SERVER_DEVICE ?= cpu
+
+run-model-server: ## Chạy BGE-M3 + reranker dynamic batcher (một worker, CPU hoặc MPS)
+	MODEL_SERVER_ENABLED=true MODEL_SERVER_DEVICE=$(MODEL_SERVER_DEVICE) MODEL_SERVER_WORKERS=1 PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m uvicorn model_server.main:app --host $(MODEL_SERVER_HOST) --port $(MODEL_SERVER_PORT) --workers 1
+
+MODEL_LOAD_REQUESTS ?= 100
+MODEL_LOAD_CONCURRENCY ?= 32
+
+load-model-server: ## Load smoke PR17 (BASE_URL=http://127.0.0.1:8082 ENDPOINT=embed|rerank)
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/load_model_server_pr17.py --base-url $(or $(BASE_URL),http://127.0.0.1:8082) --endpoint $(or $(ENDPOINT),embed) --requests $(MODEL_LOAD_REQUESTS) --concurrency $(MODEL_LOAD_CONCURRENCY)
 
 UI_DEMO_MODE ?= dev
 UI_API_BASE_URL ?= http://127.0.0.1:8080

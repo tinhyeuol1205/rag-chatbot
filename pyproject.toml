@@ -19,6 +19,9 @@ dependencies = [
 
     # Embeddings + Reranker (local)
     "numpy>=1.24,<3",
+    # Explicit runtime dependency for PR17's PyTorch MPS server.  It was
+    # previously only transitive through sentence-transformers.
+    "torch>=2.3,<3",
     "sentence-transformers>=3.0,<6",
 
     # Vector Database
