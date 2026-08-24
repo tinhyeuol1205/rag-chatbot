@@ -4,7 +4,7 @@ UV := $(shell command -v uv 2>/dev/null || echo /Users/binh.dv/.local/bin/uv)
 # Bắt uv sync đồng bộ vào đúng môi trường rag/ (thay vì tạo .venv mặc định)
 export UV_PROJECT_ENVIRONMENT := rag
 
-.PHONY: help install install-dev local-start local-stop ingest ingest-sync ingest-load run-api run-worker run-model-server load-model-server run-ui evaluate test lint check clean
+.PHONY: help install install-dev local-start local-stop ingest ingest-sync ingest-load run-api run-worker run-model-server load-model-server run-ui evaluate benchmark-latency test lint check clean
 
 help: ## Hiển thị danh sách lệnh
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -85,6 +85,14 @@ run-ui: ## Chạy thin UI qua FastAPI: UI_DEMO_MODE=dev|product
 
 evaluate: ## Chạy RAG evaluation (RAGAS metrics)
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m evaluation.evaluate
+
+BENCHMARK_QUERY ?= Chính sách nghỉ phép của công ty là gì?
+BENCHMARK_MODE ?= in-process
+BENCHMARK_RUNS ?= 3
+BENCHMARK_OUTPUT ?= artifacts/rag-latency.json
+
+benchmark-latency: ## Đo latency từng module và RAG TTFT (BENCHMARK_MODE=in-process|http|both)
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/benchmark_rag_latency.py --mode $(BENCHMARK_MODE) --query "$(BENCHMARK_QUERY)" --runs $(BENCHMARK_RUNS) --output $(BENCHMARK_OUTPUT)
 
 # ======================================
 # ------------- Testing ----------------

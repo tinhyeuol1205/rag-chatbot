@@ -127,6 +127,20 @@ Metrics:
 - **Faithfulness** — Is the answer grounded in the context?
 - **Answer Relevance** — Does the answer address the question?
 
+### Latency / TTFT benchmark
+
+Đo breakdown từng module và End-to-End time-to-first-token:
+
+```bash
+make benchmark-latency \
+  BENCHMARK_MODE=in-process \
+  BENCHMARK_QUERY="Chính sách nghỉ phép của công ty là gì?"
+```
+
+Dùng `BENCHMARK_MODE=http` để đo từ phía SSE client khi API/worker đang chạy.
+Chi tiết metric, cách đọc span và review bottleneck xem tại
+[docs/rag-latency-benchmark.md](docs/rag-latency-benchmark.md).
+
 ## 🔌 API
 
 Backend chạy ở `http://127.0.0.1:8080` (`make run-api`). Tài liệu OpenAPI tại

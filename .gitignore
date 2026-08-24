@@ -66,3 +66,7 @@ data/
 
 # Local manifests and dry-run output
 tmp/
+temp/
+
+# Local benchmark reports (may contain deployment timing metadata)
+artifacts/rag-latency*.json
