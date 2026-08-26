@@ -1,0 +1,29 @@
+{
+  "suite_id": "kiemhiep-kimdung-anh-hung-xa-dieu",
+  "version": "1",
+  "dataset_id": "kiemhiep_kimdung",
+  "expected_sources": ["anh_hung_xa_dieu.pdf"],
+  "samples": [
+    {
+      "sample_id": "naming-tinh-khang",
+      "question": "Vì sao Khưu Xử Cơ đặt tên hai đứa trẻ là Quách Tĩnh và Dương Khang?",
+      "reference": "Khưu Xử Cơ ghép hai tên Tĩnh và Khang để nhắc con cháu không quên nỗi nhục Tĩnh Khang, khi hai vua nhà Tống bị quân Kim bắt. Con của Quách Khiếu Thiên được đặt là Quách Tĩnh, còn con của Dương Thiết Tâm là Dương Khang.",
+      "relevant_sources": ["anh_hung_xa_dieu.pdf"],
+      "slice": "origin"
+    },
+    {
+      "sample_id": "guo-jing-childhood",
+      "question": "Quách Tĩnh sinh ra và lớn lên trong hoàn cảnh nào?",
+      "reference": "Lý Bình lưu lạc tới vùng Mông Cổ và sinh Quách Tĩnh giữa trời tuyết. Được những người chăn nuôi Mông Cổ giúp đỡ, bà ở lại thảo nguyên, chăn dê bò và một mình nuôi con, rồi đặt tên Quách Tĩnh theo di ngôn của chồng.",
+      "relevant_sources": ["anh_hung_xa_dieu.pdf"],
+      "slice": "origin"
+    },
+    {
+      "sample_id": "jiangnan-freaks-wager",
+      "question": "Vì sao Giang Nam thất quái đi tìm và dạy võ cho Quách Tĩnh?",
+      "reference": "Họ nhận lời đánh cuộc với Khưu Xử Cơ: mỗi bên tìm một hậu nhân của hai nhà Quách-Dương, truyền dạy võ công rồi cho hai người tỷ thí tại lầu Túy Tiên ở Gia Hưng sau mười tám năm. Vì vậy họ tới tận sa mạc tìm mẹ con Quách Tĩnh và ở lại dạy chàng.",
+      "relevant_sources": ["anh_hung_xa_dieu.pdf"],
+      "slice": "mentorship"
+    }
+  ]
+}

@@ -70,6 +70,8 @@ class Settings(BaseSettings):
             "QDRANT_QUERY_TIMEOUT_SECONDS": self.QDRANT_QUERY_TIMEOUT_SECONDS,
             "SSE_SEND_TIMEOUT_SECONDS": self.SSE_SEND_TIMEOUT_SECONDS,
             "LLM_MAX_OUTPUT_TOKENS": self.LLM_MAX_OUTPUT_TOKENS,
+            "EVAL_MAX_WORKERS": self.EVAL_MAX_WORKERS,
+            "EVAL_TIMEOUT_SECONDS": self.EVAL_TIMEOUT_SECONDS,
             "EMBEDDING_SIZE": self.EMBEDDING_SIZE,
             "QDRANT_HYBRID_PREFETCH_LIMIT": self.QDRANT_HYBRID_PREFETCH_LIMIT,
             "QDRANT_SPARSE_AVG_LEN": self.QDRANT_SPARSE_AVG_LEN,
@@ -133,6 +135,12 @@ class Settings(BaseSettings):
             raise ConfigurationError(f"Ingestion quality ratios must be between 0 and 1: {invalid_ratios}")
         if self.RAG_EXECUTION_MODE not in {"inline", "redis_worker"}:
             raise ConfigurationError("RAG_EXECUTION_MODE must be inline or redis_worker")
+        if self.EVAL_JUDGE_PROVIDER.strip().lower() not in {"", "openai", "gemini"}:
+            raise ConfigurationError("EVAL_JUDGE_PROVIDER must be empty, openai or gemini")
+        if self.EVAL_JUDGE_PROVIDER.strip() and not self.EVAL_JUDGE_MODEL.strip():
+            raise ConfigurationError("EVAL_JUDGE_MODEL is required when EVAL_JUDGE_PROVIDER is set")
+        if self.EVAL_MAX_RETRIES < 0:
+            raise ConfigurationError("EVAL_MAX_RETRIES cannot be negative")
         if self.UI_DEMO_MODE not in {"dev", "product"}:
             raise ConfigurationError("UI_DEMO_MODE must be dev or product")
         if self.UI_PUBLIC_SHARE and not (self.UI_AUTH_USERNAME.strip() and self.UI_AUTH_PASSWORD):
@@ -180,6 +188,17 @@ class Settings(BaseSettings):
                 raise ConfigurationError("Production PR14 requires BAAI/bge-reranker-v2-m3")
             if self.INGEST_SCHEMA_VERSION != "3":
                 raise ConfigurationError("Production PR14 requires INGEST_SCHEMA_VERSION=3")
+            if not (
+                self.EVAL_JUDGE_PROVIDER.strip()
+                and self.EVAL_JUDGE_MODEL.strip()
+                and self.EVAL_JUDGE_API_KEY.strip()
+            ):
+                raise ConfigurationError(
+                    "Production evaluation requires explicit EVAL_JUDGE_PROVIDER, "
+                    "EVAL_JUDGE_MODEL and EVAL_JUDGE_API_KEY"
+                )
+            if self.EVAL_ALLOW_SIMPLE_FALLBACK:
+                raise ConfigurationError("Production evaluation cannot enable simple fallback")
         if self.QDRANT_SPARSE_K <= 0 or not 0 <= self.QDRANT_SPARSE_B <= 1:
             raise ConfigurationError(
                 "QDRANT_SPARSE_K must be positive and QDRANT_SPARSE_B must be between 0 and 1"
@@ -197,6 +216,18 @@ class Settings(BaseSettings):
     # --- Google Gemini ---
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL_ID: str = "gemini-2.5-flash"
+
+    # --- Evaluation judge (independent from candidate generation) ---
+    # Empty values keep the application importable in development; strict
+    # evaluation fails closed until all three are explicitly configured.
+    EVAL_JUDGE_PROVIDER: str = ""
+    EVAL_JUDGE_MODEL: str = ""
+    EVAL_JUDGE_API_KEY: str = ""
+    EVAL_JUDGE_BASE_URL: str = ""
+    EVAL_MAX_WORKERS: int = 4
+    EVAL_TIMEOUT_SECONDS: float = 180.0
+    EVAL_MAX_RETRIES: int = 2
+    EVAL_ALLOW_SIMPLE_FALLBACK: bool = False
 
     # --- Qdrant ---
     QDRANT_HOST: str = "localhost"

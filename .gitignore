@@ -62,7 +62,11 @@ review/
 # ============================================
 # Data (chứa các file dữ liệu, không cần push)
 # ============================================
-data/
+data/*
+# Evaluation suite contracts are versioned; run artifacts remain ignored.
+!data/eval/
+!data/eval/suites/
+!data/eval/suites/*.json
 
 # Local manifests and dry-run output
 tmp/

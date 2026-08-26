@@ -127,7 +127,7 @@ class RAGRetriever:
         (bug P0-4: trước đây evaluate tự search riêng → contexts là child chunk,
         không phải parent chunk LLM thật nhận).
         """
-        logger.info("RAG query started", query=user_query[:80])
+        logger.info("RAG query started", query_chars=len(user_query))
 
         # ⓿ Condense — resolve đại từ/tham chiếu từ history TRƯỚC khi retrieval
         search_query = self.condenser.condense(user_query, history or [])
@@ -232,7 +232,7 @@ class RAGRetriever:
 
         # ⑧ LLM Generation — short-circuit nếu context rỗng (khỏi tốn LLM call vô ích)
         if not context.strip():
-            logger.warning("Empty context — skipping LLM call", query=user_query[:80])
+            logger.warning("Empty context — skipping LLM call", query_chars=len(user_query))
             return iter([NO_CONTEXT_MSG]) if stream else NO_CONTEXT_MSG
 
         # ★ Dùng search_query (đã condense) cho generate — để LLM thấy câu hỏi độc lập,
@@ -271,6 +271,8 @@ class RAGRetriever:
         self,
         user_query: str,
         history: list[tuple[str, str]] | None = None,
+        *,
+        include_contexts: bool = False,
     ):
         """Stream token events rồi sources sau khi generation hoàn tất.
 
@@ -291,6 +293,22 @@ class RAGRetriever:
                     assembled.sources_text,
                 )
             )
+
+        if include_contexts:
+            # Internal worker metadata is consumed by the queue serializer and
+            # never forwarded by the public SSE adapter.  Keeping it on the
+            # same retrieval/generation pass makes evaluation contexts exact.
+            yield {
+                "event": "contexts",
+                "data": [document["content"] for document in assembled.documents],
+            }
+            yield {
+                "event": "metadata",
+                "data": {
+                    "expanded_queries": list(retrieval.expanded_queries),
+                    "num_candidates": len(assembled.documents),
+                },
+            }
 
         yield {
             "event": "sources",

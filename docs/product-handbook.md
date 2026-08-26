@@ -574,6 +574,28 @@ LLM_RATE_LIMIT_WINDOW_SECONDS=60
 - Job chờ quá lâu nhận `504` và được cancel/request cancel.
 - Không retry mù request generation; client nên backoff theo `Retry-After`.
 
+### 9.6 Evaluation quality gate (PR18)
+
+Evaluation phải chạy suite đã version và pin cùng `dataset_id` với generation
+đang active. Lệnh release:
+
+```bash
+make evaluate \
+  EVAL_SUITE=data/eval/suites/kiemhiep-kimdung.json \
+  EVAL_OUTPUT_DIR=data/eval_runs
+```
+
+Preflight kiểm tra aliases, schema/pipeline fingerprint và source coverage trước
+khi gọi judge. Product mode đi qua Redis worker/admission; không ép evaluator về
+inline. Judge phải có `EVAL_JUDGE_PROVIDER`, `EVAL_JUDGE_MODEL` và
+`EVAL_JUDGE_API_KEY` riêng, được pin theo experiment; không dùng candidate model
+ngầm làm judge.
+
+Artifact run bất biến có schema v2; `latest.json` chỉ là bản tiện dụng. Mặc định
+artifact chỉ chứa IDs, counts, scores, latency và fingerprint, không chứa raw
+query/answer/reference/context. Fallback keyword chỉ dành cho
+`make evaluate-local`, luôn exit non-zero và không được làm release pass.
+
 ## 10. PRODUCT — thay đổi model hoặc schema
 
 Không đổi model/dimension tại chỗ.
@@ -630,7 +652,9 @@ Rollback phải dùng application config/model tương thích với generation c
 [ ] Full backfill staging hoàn tất
 [ ] failed_files rỗng
 [ ] sparse coverage và parent references đạt
-[ ] Evaluation Việt/Anh đạt ngưỡng
+[ ] Evaluation suite đã pin đúng dataset/generation/source coverage
+[ ] Judge provider/model độc lập đã pin; `make evaluate` đạt ngưỡng và exit 0
+[ ] Artifact evaluation schema v2 được redacted; không có raw query/context
 [ ] Alias switch thành công
 [ ] Worker chạy cùng REDIS_QUEUE_GROUP
 [ ] `/ready` 200

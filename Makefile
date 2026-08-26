@@ -4,7 +4,7 @@ UV := $(shell command -v uv 2>/dev/null || echo /Users/binh.dv/.local/bin/uv)
 # Bắt uv sync đồng bộ vào đúng môi trường rag/ (thay vì tạo .venv mặc định)
 export UV_PROJECT_ENVIRONMENT := rag
 
-.PHONY: help install install-dev local-start local-stop ingest ingest-sync ingest-load run-api run-worker run-model-server load-model-server run-ui evaluate benchmark-latency test lint check clean
+.PHONY: help install install-dev local-start local-stop ingest ingest-sync ingest-load run-api run-worker run-model-server load-model-server run-ui evaluate evaluate-local benchmark-latency test lint check clean
 
 help: ## Hiển thị danh sách lệnh
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-25s\033[0m %s\n", $$1, $$2}'
@@ -83,8 +83,14 @@ run-ui: ## Chạy thin UI qua FastAPI: UI_DEMO_MODE=dev|product
 # ----------- Evaluation ---------------
 # ======================================
 
-evaluate: ## Chạy RAG evaluation (RAGAS metrics)
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m evaluation.evaluate
+EVAL_SUITE ?= data/eval/suites/kiemhiep-kimdung.json
+EVAL_OUTPUT_DIR ?= data/eval_runs
+
+evaluate: ## Chạy strict RAG quality gate (RAGAS + corpus preflight)
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m evaluation.evaluate --suite $(EVAL_SUITE) --output-dir $(EVAL_OUTPUT_DIR)
+
+evaluate-local: ## Chẩn đoán local; fallback không bao giờ pass quality gate
+	EVAL_ALLOW_SIMPLE_FALLBACK=true PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m evaluation.evaluate --suite $(EVAL_SUITE) --output-dir $(EVAL_OUTPUT_DIR) --allow-simple-fallback
 
 BENCHMARK_QUERY ?= Chính sách nghỉ phép của công ty là gì?
 BENCHMARK_MODE ?= in-process

@@ -59,7 +59,7 @@ class MultiQueryExpander:
         Returns:
             [original_query, variant_1, variant_2, ...variant_N]
         """
-        logger.info("Expanding query", original=query, n_variants=settings.EXPAND_N_QUERY)
+        logger.info("Expanding query", query_chars=len(query), n_variants=settings.EXPAND_N_QUERY)
 
         try:
             raw_output = self.llm.generate(
@@ -73,7 +73,7 @@ class MultiQueryExpander:
         except Exception as e:  # noqa: BLE001 - optional LLM enhancement must degrade
             # ★ Degrade: không có variant vẫn search được bằng query gốc
             logger.warning("Multi-query expansion failed, using original query only",
-                           error=str(e))
+                           error_type=type(e).__name__)
             return [query]
 
         variants = self._parse_variants(raw_output, exclude=query)
@@ -81,7 +81,7 @@ class MultiQueryExpander:
         # Ghép query gốc + các biến thể
         all_queries = [query] + variants[:settings.EXPAND_N_QUERY]
 
-        logger.info("Query expanded", total_queries=len(all_queries), variants=variants)
+        logger.info("Query expanded", total_queries=len(all_queries), variant_count=len(variants))
         return all_queries
 
     def _parse_variants(self, raw_output: str, exclude: str) -> list[str]:
@@ -107,4 +107,3 @@ class MultiQueryExpander:
             seen.add(key)
             variants.append(line)
         return variants
-

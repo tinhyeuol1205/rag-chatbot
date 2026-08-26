@@ -138,19 +138,9 @@ def _run_stream_job(query: str, history: list[tuple[str, str]]) -> list:
 
 def _result_from_payload(payload: object):
     """Restore a worker JSON result without coupling Redis to API models."""
-    from retrieval.context.assembler import SourceRef
-    from retrieval.retriever import RAGResult
+    from retrieval.result_codec import result_from_payload
 
-    if isinstance(payload, RAGResult):
-        return payload
-    data = payload if isinstance(payload, dict) else {}
-    return RAGResult(
-        answer=str(data.get("answer", "")),
-        contexts=list(data.get("contexts", []) or []),
-        sources=[SourceRef(**source) for source in data.get("sources", []) or []],
-        expanded_queries=list(data.get("expanded_queries", []) or []),
-        num_candidates=int(data.get("num_candidates", 0)),
-    )
+    return result_from_payload(payload)
 
 
 def _history_pairs(history: list[HistoryMessage]) -> list[tuple[str, str]]:

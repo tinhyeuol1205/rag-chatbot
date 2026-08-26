@@ -116,16 +116,27 @@ src/
 
 ## 📊 Evaluation
 
-Run RAG Triad evaluation:
+Run the strict, corpus-pinned RAG quality gate (RAGAS 0.4 collections):
 
 ```bash
 make evaluate
 ```
 
 Metrics:
-- **Context Relevance** — Are retrieved chunks relevant to the query?
+- **Context Precision** — Are retrieved contexts relevant to the reference/query?
 - **Faithfulness** — Is the answer grounded in the context?
-- **Answer Relevance** — Does the answer address the question?
+- **Answer Relevancy** — Does the answer address the question?
+- **Source/citation recall** — Did the assembled prompt contain expected sources?
+
+The default suite is pinned to `kiemhiep_kimdung`; preflight stops before paid calls when the
+configured dataset, aliases, generation or source coverage do not match. Product
+evaluation uses the configured Redis worker/admission topology. Configure an
+independent judge with `EVAL_JUDGE_PROVIDER`, `EVAL_JUDGE_MODEL` and
+`EVAL_JUDGE_API_KEY`; the evaluator never lets RAGAS choose a provider implicitly.
+
+Artifacts are immutable under `data/eval_runs/` and redacted by default. For a
+trusted local diagnostic only, use `make evaluate-local`; its simple fallback
+always exits non-zero and cannot satisfy release thresholds.
 
 ### Latency / TTFT benchmark
 
