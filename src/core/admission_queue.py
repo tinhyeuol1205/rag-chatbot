@@ -636,19 +636,10 @@ class RedisAdmissionQueue:
 
 
 def _json_safe(value: Any) -> dict[str, Any]:
-    """Serialize an RAGResult without importing API modules into core."""
-    if isinstance(value, dict):
-        return value
-    sources = []
-    for source in getattr(value, "sources", []) or []:
-        sources.append(source.as_dict() if hasattr(source, "as_dict") else dict(source))
-    return {
-        "answer": getattr(value, "answer", ""),
-        "contexts": list(getattr(value, "contexts", []) or []),
-        "sources": sources,
-        "expanded_queries": list(getattr(value, "expanded_queries", []) or []),
-        "num_candidates": int(getattr(value, "num_candidates", 0)),
-    }
+    """Serialize an RAGResult using the shared API/worker/eval codec."""
+    from retrieval.result_codec import result_to_payload
+
+    return result_to_payload(value)
 
 
 _queue_instance: RedisAdmissionQueue | InlineAdmissionQueue | None = None

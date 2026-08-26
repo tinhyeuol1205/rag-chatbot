@@ -60,12 +60,16 @@ class QueryCondenser:
             ).strip()
         except Exception as e:  # noqa: BLE001 - optional LLM enhancement must degrade
             # Cùng nguyên tắc graceful degradation như PR 1 / P1-7
-            logger.warning("Condensation failed, using original question", error=str(e))
+            logger.warning("Condensation failed, using original question", error_type=type(e).__name__)
             return question
 
         if not rewritten or len(rewritten) > 500:
             logger.warning("Condensation output rejected, using original",
                            length=len(rewritten))
             return question
-        logger.info("Query condensed", original=question[:60], rewritten=rewritten[:60])
+        logger.info(
+            "Query condensed",
+            original_chars=len(question),
+            rewritten_chars=len(rewritten),
+        )
         return rewritten

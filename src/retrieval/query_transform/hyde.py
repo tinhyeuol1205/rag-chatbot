@@ -59,7 +59,7 @@ class HyDEGenerator:
         try:
             hypothetical_answer = self._generate_hypothetical(query)
         except Exception as e:  # noqa: BLE001 - optional LLM enhancement must degrade
-            logger.warning("HyDE generation failed, skipping HyDE", error=str(e))
+            logger.warning("HyDE generation failed, skipping HyDE", error_type=type(e).__name__)
             return None
         if not hypothetical_answer.strip():
             logger.warning("HyDE returned empty text, skipping HyDE")
@@ -70,8 +70,8 @@ class HyDEGenerator:
 
         logger.info(
             "HyDE embedding generated",
-            query=query[:50],
-            hypothetical=hypothetical_answer[:80],
+            query_chars=len(query),
+            hypothetical_chars=len(hypothetical_answer),
         )
         return vector
 

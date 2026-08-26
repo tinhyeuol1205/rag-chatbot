@@ -35,20 +35,33 @@ def _handle_job_stream(
     """Run RAG and forward each provider token to the job event stream."""
     answer_parts: list[str] = []
     sources: list[dict[str, Any]] = []
-    for event in get_retriever().stream_with_sources(query, history=history):
-        emit(event)
+    contexts: list[str] = []
+    expanded_queries: list[str] = []
+    num_candidates = 0
+    for event in get_retriever().stream_with_sources(
+        query,
+        history=history,
+        include_contexts=True,
+    ):
         event_name = event.get("event") if isinstance(event, dict) else ""
         data = event.get("data", "") if isinstance(event, dict) else ""
+        if event_name not in {"contexts", "metadata"}:
+            emit(event)
         if event_name == "token":
             answer_parts.append(str(data.get("text", "") if isinstance(data, dict) else data))
         elif event_name == "sources":
             sources = list(data.get("sources", []) if isinstance(data, dict) else data or [])
+        elif event_name == "contexts":
+            contexts = [str(item) for item in data or []]
+        elif event_name == "metadata":
+            expanded_queries = [str(item) for item in data.get("expanded_queries", [])]
+            num_candidates = int(data.get("num_candidates", 0))
     return {
         "answer": "".join(answer_parts),
         "sources": sources,
-        "contexts": [],
-        "expanded_queries": [],
-        "num_candidates": len(sources),
+        "contexts": contexts,
+        "expanded_queries": expanded_queries,
+        "num_candidates": num_candidates or len(contexts),
     }
 
 

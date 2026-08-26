@@ -16,6 +16,8 @@ dependencies = [
     # LLM (OpenAI-compatible + Google Gemini)
     "openai>=1.30,<3",
     "google-genai==2.15.0",
+    # Instructor's google-genai schema adapter imports jsonref at metric call time.
+    "jsonref>=1.1.0,<2",
 
     # Embeddings + Reranker (local)
     "numpy>=1.24,<3",
@@ -44,9 +46,8 @@ dependencies = [
     "gradio>=4.0,<7",
 
     # Evaluation (RAG metrics)
-    "ragas>=0.2,<0.5",
+    "ragas>=0.4.3,<0.5",
     "langchain-openai>=0.2,<1",
-    "langchain-huggingface>=0.1,<1",
 ]
 
 [project.optional-dependencies]
@@ -67,3 +68,6 @@ package = false
 [tool.ruff]
 line-length = 120
 target-version = "py310"
+
+[tool.pytest.ini_options]
+pythonpath = [".", "src"]
