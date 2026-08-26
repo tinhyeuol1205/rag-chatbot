@@ -24,6 +24,55 @@
       "reference": "Họ nhận lời đánh cuộc với Khưu Xử Cơ: mỗi bên tìm một hậu nhân của hai nhà Quách-Dương, truyền dạy võ công rồi cho hai người tỷ thí tại lầu Túy Tiên ở Gia Hưng sau mười tám năm. Vì vậy họ tới tận sa mạc tìm mẹ con Quách Tĩnh và ở lại dạy chàng.",
       "relevant_sources": ["anh_hung_xa_dieu.pdf"],
       "slice": "mentorship"
+    },
+    {
+      "sample_id": "chen-xuanfeng-defeat",
+      "question": "Quách Tĩnh đã hạ Trần Huyền Phong bằng cách nào?",
+      "reference": "Trong lúc trời tối và bị Trần Huyền Phong túm giữ, Quách Tĩnh rút thanh chủy thủ mang theo rồi đâm trúng rốn đối phương. Đây đúng là yếu huyệt của môn công phu hoành luyện mà Trần Huyền Phong đang luyện, nên hắn bị trọng thương chí mạng.",
+      "relevant_sources": ["anh_hung_xa_dieu.pdf"],
+      "slice": "combat"
+    },
+    {
+      "sample_id": "guo-jing-meets-huang-rong",
+      "question": "Quách Tĩnh và Hoàng Dung quen nhau lần đầu ở đâu và trong hoàn cảnh nào?",
+      "reference": "Hai người gặp nhau tại Trương Gia Khẩu khi Quách Tĩnh vừa từ thảo nguyên vào Trung Nguyên. Hoàng Dung đang cải trang thành một thiếu niên nghèo, còn Quách Tĩnh chân thành mời nàng ăn uống và đối đãi rất hào phóng, khiến hai người nhanh chóng thân thiết.",
+      "relevant_sources": ["anh_hung_xa_dieu.pdf"],
+      "slice": "relationship"
+    },
+    {
+      "sample_id": "huang-rong-family",
+      "question": "Hoàng Dung là con của ai và lớn lên ở đâu?",
+      "reference": "Hoàng Dung là con gái duy nhất của Hoàng Dược Sư, người có ngoại hiệu Đông Tà và là đảo chủ đảo Đào Hoa. Mẹ nàng mất khi sinh, nên nàng lớn lên trên đảo cùng cha và được học võ công, âm dương ngũ hành cùng nhiều môn học khác từ ông.",
+      "relevant_sources": ["anh_hung_xa_dieu.pdf"],
+      "slice": "character"
+    },
+    {
+      "sample_id": "dragon-palms-teacher",
+      "question": "Ai truyền Hàng Long thập bát chưởng cho Quách Tĩnh?",
+      "reference": "Bắc Cái Hồng Thất Công truyền Hàng Long thập bát chưởng cho Quách Tĩnh. Hoàng Dung dùng tài nấu ăn để làm Hồng Thất Công vui lòng, nhờ đó ông chỉ dạy thêm các chiêu chưởng pháp cho Quách Tĩnh.",
+      "relevant_sources": ["anh_hung_xa_dieu.pdf"],
+      "slice": "martial_arts"
+    },
+    {
+      "sample_id": "wanyan-honglie-identity",
+      "question": "Nhan Liệt thực sự là ai?",
+      "reference": "Nhan Liệt là tên được Hoàn Nhan Hồng Liệt sử dụng để che giấu thân phận. Ông ta là vương tử thứ sáu của nước Kim và được phong làm Triệu Vương.",
+      "relevant_sources": ["anh_hung_xa_dieu.pdf"],
+      "slice": "identity"
+    },
+    {
+      "sample_id": "yang-kang-parentage",
+      "question": "Thân thế thật sự của Dương Khang là gì?",
+      "reference": "Dương Khang là con ruột của Dương Thiết Tâm và Bao Tích Nhược. Chàng lớn lên trong phủ Triệu Vương, mang tên Hoàn Nhan Khang và từng tin Hoàn Nhan Hồng Liệt là cha mình, nên bị giằng co giữa nguồn gốc người Hán và địa vị tiểu vương gia nước Kim.",
+      "relevant_sources": ["anh_hung_xa_dieu.pdf"],
+      "slice": "identity"
+    },
+    {
+      "sample_id": "beggars-sect-leadership",
+      "question": "Hoàng Dung đã chứng minh quyền kế nhiệm bang chủ Cái Bang như thế nào?",
+      "reference": "Hoàng Dung có Đả Cẩu Bổng và được Hồng Thất Công truyền Đả Cẩu Bổng pháp cùng chức bang chủ. Tại đại hội Cái Bang, nàng dùng chính bổng pháp để đoạt lại cây trúc bổng từ Dương Khang, vạch trần việc chàng mạo nhận quyền kế nhiệm và khiến bang chúng công nhận mình.",
+      "relevant_sources": ["anh_hung_xa_dieu.pdf"],
+      "slice": "leadership"
     }
   ]
 }
